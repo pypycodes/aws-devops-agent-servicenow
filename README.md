@@ -6,6 +6,8 @@ This tutorial demonstrates how you can use the [AWS DevOps Agent boto3 API](http
 
 ![Automated Incident Lifecycle](docs/incident-lifecycle.gif)
 
+> **Note:** The "Corrective Action" step shown in the diagram above is not performed by AWS DevOps Agent. The agent provides investigation findings and mitigation recommendations — actual recovery actions are executed by operators or external automation.
+
 An Amazon CloudWatch alarm fires, a webhook triggers AWS DevOps Agent to autonomously investigate, and the `agent_monitor.py` script polls for completion — extracting root cause findings, triggering mitigation via the SendMessage API, and surfacing corrective actions. No human touches the console.
 
 ## What You'll Build
@@ -34,8 +36,15 @@ EventBridge (1-min) ──► SimpleLambda (128MB, 90s)
                                                                      │
                                                               ┌──────┴──────┐
                                                               ▼             ▼
-                                                        Investigation   Mitigation
-                                                         (auto RCA)     (auto plan)
+                                                        Investigation   Mitigation Plan
+                                                         (auto RCA)    (recommendations)
+                                                    · · · · · · · · · · · · · · · · · · ·
+                                                                           ▼
+                                                                    Recovery Action *
+                                                                     (user/script)
+
+* Recovery actions are not performed by AWS DevOps Agent.
+  They are executed by operators or automation.
 ```
 
 ---
