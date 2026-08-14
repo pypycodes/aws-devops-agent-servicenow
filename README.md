@@ -54,8 +54,8 @@ EventBridge (1-min) ──► SimpleLambda (128MB, 90s)
 ### Step 1 — Clone the Repository
 
 ```bash
-git clone https://github.com/aws-samples/sample-aws-devops-agent-incident-lifecycle.git
-cd sample-aws-devops-agent-incident-lifecycle
+git clone https://github.com/aws-samples/sample-automated-incident-lifecycle-with-aws-devops-agent.git
+cd sample-automated-incident-lifecycle-with-aws-devops-agent
 ```
 
 ---
