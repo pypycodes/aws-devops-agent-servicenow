@@ -40,6 +40,29 @@ def log(msg):
     print(f"  {C['d']}[{ts()}]{C['0']} {msg}")
 
 
+# --- Execution ID helpers ---
+
+# executionId comes back from list_executions/get_task prefixed like
+# "exe-ops1-3bc58497-29fb-4fc1-a5a2-8f2a6a0d3f05", but send_message's
+# executionId param is validated server-side against a bare UUID regex
+# (^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$).
+# Strip the "exe-<agentType>-" prefix down to just the UUID before
+# passing it to send_message. Other calls (get_task, list_journal_records)
+# keep using the full prefixed id since that's the resource identifier.
+EXECUTION_UUID_RE = re.compile(
+    r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+)
+
+
+def bare_execution_id(eid):
+    """Extract the bare UUID suffix from a prefixed executionId.
+    Returns the input unchanged if it doesn't match the expected pattern."""
+    if not eid:
+        return eid
+    m = EXECUTION_UUID_RE.search(eid)
+    return m.group(1) if m else eid
+
+
 # --- API calls ---
 
 def make_client():
@@ -67,22 +90,35 @@ def fetch_journal(cl, sid, eid):
 
 
 def trigger_mitigation(cl, sid, eid):
-    """Send message to investigation execution to trigger mitigation plan generation.
+    """Send message to the investigation execution to trigger mitigation plan generation.
     This is the programmatic equivalent of clicking 'Generate mitigation plan' in the console.
-    The send-message call with userActionResponse re-activates the completed investigation.
-    Security: Plans are displayed for human review only — no auto-execution of remediation."""
-    try:
-        cl.send_message(
-            agentSpaceId=sid,
-            executionId=eid,
-            userId=USER_ID,
-            content="Generate mitigation plan",
-            context={"userActionResponse": "generate_mitigation_plan"},
-        )
-        return True
-    except Exception as e:
-        log(f"{C['r']}send-message failed: {e}{C['0']}")
-        return False
+
+    executionId comes back prefixed like 'exe-ops1-3bc58497-...-8f2a6a0d3f05'. We try the
+    full prefixed id first (this is what the console appears to use, per observed behavior),
+    and only fall back to the bare UUID suffix if that call fails.
+
+    Security: Plans are displayed for human review only — no auto-execution of remediation.
+    """
+    attempts = [("full", eid)]
+    stripped = bare_execution_id(eid)
+    if stripped != eid:
+        attempts.append(("stripped", stripped))
+
+    last_err = None
+    for label, exec_id in attempts:
+        try:
+            log(f"{C['d']}debug: trying executionId ({label})={exec_id!r}{C['0']}")
+            cl.send_message(
+                agentSpaceId=sid,
+                executionId=exec_id,
+                content="Generate mitigation plan",
+            )
+            return True
+        except Exception as e:
+            last_err = e
+            log(f"{C['r']}send-message failed ({label}): {e}{C['0']}")
+
+    return False
 
 
 # --- Journal parsers ---
@@ -132,6 +168,7 @@ def show_task(task):
     print(f"  {C['d']}├─{C['0']} Type:     {task['taskType']}")
     print(f"  {C['d']}├─{C['0']} Priority: {task['priority']}")
     print(f"  {C['d']}└─{C['0']} Created:  {task['createdAt']}")
+    print(f"  {C['d']}├─{C['0']} Exec ID:  {task['executionId']}") #added new
 
 
 def show_rca(finding):

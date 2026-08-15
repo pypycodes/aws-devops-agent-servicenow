@@ -73,7 +73,7 @@ Run the prerequisites script. This checks your environment and **auto-installs**
 - Prompts to auto-install any missing tools
 - Verifies Python version is 3.11+
 - Shows next steps for AWS credentials, AWS DevOps Agent space, and webhook setup
-- Guides you to the deploy command when ready
+- Directs you to provision the DevOps Agent stack before the main demo deployment
 
 | Tool | Auto-install | Manual install guide |
 |------|:-----------:|----------------------|
@@ -90,6 +90,31 @@ If AWS credentials are not configured, run:
 aws configure
 # Enter your AWS Access Key ID, Secret Access Key, and default region (us-east-1)
 ```
+
+---
+
+### Step 3A — Configure AWS DevOps Agent Space Environment
+
+This step must happen before the demo infrastructure is deployed.
+
+```bash
+# AWS profile (from ~/.aws/credentials or ~/.aws/config)
+AWS_PROFILE=default
+
+# Deployment environment name
+ENV=dev
+
+# AWS region
+AWS_REGION=us-east-1
+```
+
+Deploy the AWS DevOps Agent CloudFormation stack first:
+
+```bash
+./doa.sh agent-stack
+```
+
+> This creates the AWS DevOps Agent space before the rest of the demo stack is deployed.
 
 ---
 
@@ -119,6 +144,15 @@ WEBHOOK_SECRET=<your-secret>
 ```
 
 > **Note:** See the [AWS DevOps Agent CLI onboarding guide](https://docs.aws.amazon.com/devopsagent/latest/userguide/getting-started-with-aws-devops-agent-cli-onboarding-guide.html) to create an agent space and get webhook credentials.
+
+Use the devops-agent-stack.yaml and apply the cloudformation stack for agent space:
+aws cloudformation deploy \
+  --template-file devops-agent-stack.yaml \
+  --stack-name CTDevOpsAgentStack \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+
+Post that create the webhook via console (its not supported via CF Template) and pre-fill the .env file with details.
 
 The `.env` file is gitignored to prevent committing secrets. All `doa.sh` commands load it automatically.
 

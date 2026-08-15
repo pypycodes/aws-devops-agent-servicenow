@@ -19,13 +19,16 @@ fi
 REGION="${AWS_REGION:-us-east-1}"
 
 # Require ENV to be set (except for pre and help)
-# Require all .env values to be set
+# Require webhook settings only for later operational steps, not the initial agent stack deployment
 require_env() {
+  local mode="${1:-full}"
   local missing=()
   [[ -z "${ENV:-}" ]] && missing+=("ENV")
   [[ -z "${AWS_PROFILE:-}" ]] && missing+=("AWS_PROFILE")
-  [[ -z "${WEBHOOK_URL:-}" ]] && missing+=("WEBHOOK_URL")
-  [[ -z "${WEBHOOK_SECRET:-}" ]] && missing+=("WEBHOOK_SECRET")
+  if [[ "$mode" != "agent-stack" ]]; then
+    [[ -z "${WEBHOOK_URL:-}" ]] && missing+=("WEBHOOK_URL")
+    [[ -z "${WEBHOOK_SECRET:-}" ]] && missing+=("WEBHOOK_SECRET")
+  fi
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo -e "  ${R}✘${N} Missing required values in .env: ${missing[*]}"
     exit 1
@@ -207,25 +210,71 @@ pre() {
     echo -e "  ${D}    export WEBHOOK_SECRET=your-secret${N}"
   fi
 
-  echo -e "\n  ${B}Ready to deploy? Run:${N}"
+  echo -e "\n  ${B}Ready to provision the agent stack? Run:${N}"
   echo -e "  ${D}    export ENV=dev${N}"
   echo -e "  ${D}    export AWS_REGION=us-east-1${N}"
-  echo -e "  ${D}    ./doa.sh deploy    # Sets up DynamoDB, Lambda, EventBridge, SNS, CloudWatch Alarms${N}"
+  echo -e "  ${D}    ./doa.sh agent-stack   # Creates the AWS DevOps Agent space / CloudFormation stack${N}"
+  echo -e "  ${D}    # Then add WEBHOOK_URL and WEBHOOK_SECRET to .env, and run:${N}"
+  echo -e "  ${D}    ./doa.sh deploy        # Sets up DynamoDB, Lambda, EventBridge, SNS, CloudWatch Alarms${N}"
+  echo ""
+}
+
+# ── PROVISION DEVOPS AGENT STACK ──
+provision_agent_stack() {
+  init
+  header "Provision DevOps Agent Stack"
+
+  STACK_NAME_AGENT="CTDevOpsAgentStack"
+  AGENT_SPACE_NAME="${ENV}-CTDevOpsAgentSpace"
+
+  echo -e "  ${B}Agent Stack Target${N}"
+  echo -e "  ${D}├─${N} Account:     $ACCOUNT_ID"
+  echo -e "  ${D}├─${N} Region:      $REGION"
+  echo -e "  ${D}├─${N} Stack:       $STACK_NAME_AGENT"
+  echo -e "  ${D}└─${N} Agent Space: $AGENT_SPACE_NAME"
+  echo
+  read -rp "  Proceed? [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo -e "  ${D}Aborted.${N}"; exit 0; }
+
+  step "Deploying CloudFormation stack: $STACK_NAME_AGENT"
+  if spin "Provisioning DevOps agent stack..." \
+    aws cloudformation deploy \
+      --template-file "$SCRIPT_DIR/devops-agent-stack.yaml" \
+      --stack-name "$STACK_NAME_AGENT" \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides \
+        AgentSpaceName="$AGENT_SPACE_NAME" \
+        AgentSpaceDescription="Agent space deployed with CloudFormation for ${ENV} CT DevOpsAgent Demo" \
+      --region "$REGION" \
+      --no-fail-on-empty-changeset; then
+    ok "Agent stack provisioned"
+  else
+    fail "DevOps agent stack deployment failed. Run: aws cloudformation describe-stack-events --stack-name $STACK_NAME_AGENT --region $REGION"
+  fi
+
+  step "Checking agent space registration..."
+  aws devops-agent list-agent-spaces --region "$REGION" --query "agentSpaces[?name=='${AGENT_SPACE_NAME}'].[agentSpaceId,name]" --output table 2>/dev/null || true
+  echo -e "\n  ${B}Next step:${N}"
+  echo -e "  ${D}1.${N} Edit .env and set WEBHOOK_URL and WEBHOOK_SECRET${N}"
+  echo -e "  ${D}2.${N} Run: ./doa.sh deploy${N}"
   echo ""
 }
 
 # ── DEPLOY: Infrastructure ──
 deploy() {
   init
+  provision_agent_stack
   header "Deploy Infrastructure"
 
   # Show deployment summary
   AGENT_SPACE=$(aws devops-agent list-agent-spaces --region "$REGION" --query 'agentSpaces[0].{id:agentSpaceId,name:name}' --output text 2>/dev/null || echo "none")
+  STACK_NAME_AGENT=$(aws cloudformation list-stacks --query "StackSummaries[?starts_with(StackName, 'CTDevOpsAgent')].StackName" --output text  2>/dev/null || echo "none")
   echo -e "  ${B}Deployment Target${N}"
   echo -e "  ${D}├─${N} Account:     $ACCOUNT_ID"
   echo -e "  ${D}├─${N} Region:      $REGION"
   echo -e "  ${D}├─${N} Agent Space: $AGENT_SPACE"
-  echo -e "  ${D}└─${N} Stack:       $STACK_NAME"
+  echo -e "  ${D}└─${N} InfraStack:       $STACK_NAME"
+  # echo -e "  ${D}└─${N} AgentStack:       $STACK_NAME_AGENT"
   echo
   read -rp "  Proceed? [y/N] " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo -e "  ${D}Aborted.${N}"; exit 0; }
@@ -391,17 +440,56 @@ verify() {
   echo ""
 }
 
+# ── DYNAMODB WAIT HELPERS ──
+wait_for_dynamodb_table_active() {
+  local table_name="${1:-${ENV}-stress-test-table}"
+  aws dynamodb wait table-active --table-name "$table_name" --region "$REGION" >/dev/null
+}
+
+assert_dynamodb_billing_mode() {
+  local table_name="${1:-${ENV}-stress-test-table}"
+  local expected_mode="$2"
+  local actual_mode
+  actual_mode=$(aws dynamodb describe-table \
+    --table-name "$table_name" \
+    --region "$REGION" \
+    --query 'Table.BillingModeSummary.BillingMode' \
+    --output text 2>/dev/null || echo "UNKNOWN")
+
+  if [[ "$actual_mode" != "$expected_mode" ]]; then
+    fail "DynamoDB billing mode still shows '$actual_mode' for $table_name; expected '$expected_mode'"
+  fi
+}
+
+update_dynamodb_billing_mode() {
+  local table_name="${1:-${ENV}-stress-test-table}"
+  local billing_mode="$2"
+
+  if [[ "$billing_mode" == "PROVISIONED" ]]; then
+    aws dynamodb update-table \
+      --table-name "$table_name" \
+      --billing-mode PROVISIONED \
+      --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=2 \
+      --region "$REGION"
+  else
+    aws dynamodb update-table \
+      --table-name "$table_name" \
+      --billing-mode PAY_PER_REQUEST \
+      --region "$REGION"
+  fi
+}
+
 # ── TRIGGER ──
 trigger() {
   init
   header "Trigger Incident"
 
   step "Injecting fault: switching DynamoDB to provisioned (2 WCU)..."
-  aws dynamodb update-table \
-    --table-name "${ENV}-stress-test-table" \
-    --billing-mode PROVISIONED \
-    --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=2 \
-    --region "$REGION" &>/dev/null
+  update_dynamodb_billing_mode "${ENV}-stress-test-table" "PROVISIONED" || fail "Failed to switch table to PROVISIONED mode"
+
+  step "Waiting for DynamoDB table to finish the billing-mode update..."
+  wait_for_dynamodb_table_active "${ENV}-stress-test-table"
+  assert_dynamodb_billing_mode "${ENV}-stress-test-table" "PROVISIONED"
   ok "Table now at 2 WCU — throttling will start on next Lambda invocation"
 
   step "Invoking Lambda immediately to start throttling..."
@@ -420,10 +508,11 @@ restore() {
   header "Restore"
 
   step "Restoring DynamoDB to on-demand..."
-  aws dynamodb update-table \
-    --table-name "${ENV}-stress-test-table" \
-    --billing-mode PAY_PER_REQUEST \
-    --region "$REGION" &>/dev/null
+  update_dynamodb_billing_mode "${ENV}-stress-test-table" "PAY_PER_REQUEST" || fail "Failed to switch table back to PAY_PER_REQUEST mode"
+
+  step "Waiting for DynamoDB table to finish the update before exiting..."
+  wait_for_dynamodb_table_active "${ENV}-stress-test-table"
+  assert_dynamodb_billing_mode "${ENV}-stress-test-table" "PAY_PER_REQUEST"
   ok "Table restored to on-demand — throttling will stop"
   echo ""
   echo -e "  ${B}Next step — clean up all resources when done:${N}"
@@ -448,12 +537,13 @@ cleanup() {
   header "Cleanup"
 
   CONFIG_BUCKET="${ENV}-simple-lambda-config-${ACCOUNT_ID}"
-
+  STACK_NAME_AGENT=$(aws cloudformation list-stacks --query "StackSummaries[?starts_with(StackName, 'CTDevOpsAgentStack')].StackName" --output text  2>/dev/null || echo "none")
   # Show cleanup summary
   echo -e "  ${R}${B}⚠ This will permanently delete:${N}"
   echo -e "  ${D}├─${N} Account:  $ACCOUNT_ID"
   echo -e "  ${D}├─${N} Region:   $REGION"
-  echo -e "  ${D}├─${N} Stack:    $STACK_NAME"
+  echo -e "  ${D}├─${N} InfraStack:    $STACK_NAME"
+  echo -e "  ${D}├─${N} AgentStack:    $STACK_NAME_AGENT"
   echo -e "  ${D}├─${N} Bucket:   $CONFIG_BUCKET"
   echo -e "  ${D}├─${N} Bucket:   $BUCKET"
   echo -e "  ${D}└─${N} Logs:     /aws/lambda/${ENV}-simple-lambda, /aws/lambda/${ENV}-devops-agent-webhook"
@@ -503,6 +593,15 @@ if objects:
   aws s3 rb "s3://$BUCKET" --force --region "$REGION" 2>/dev/null && \
     ok "Bucket removed" || warn "Bucket may not exist"
 
+  step "Deleting stack: $STACK_NAME_AGENT"
+  aws cloudformation delete-stack --stack-name "$STACK_NAME_AGENT" --region "$REGION"
+  if spin "Waiting for stack deletion..." \
+    aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME_AGENT" --region "$REGION"; then
+    ok "Stack deleted"
+  else
+    warn "Stack deletion may still be in progress"
+  fi
+
   ok "Cleanup complete"
   echo ""
   echo -e "  ${B}All resources removed. To redeploy:${N}"
@@ -517,22 +616,25 @@ usage() {
   echo -e "  ${B}Setup:${N}"
   echo -e "    cp .env.example .env    ${D}# configure account, region, webhook creds${N}\n"
   echo -e "  ${B}Commands:${N}"
-  echo -e "    ${C}pre${N}        Check prerequisites (CLI tools, credentials, agent space)"
-  echo -e "    ${C}deploy${N}     Deploy infrastructure (DynamoDB, Lambda, SNS, Alarms)"
-  echo -e "    ${C}verify${N}     Verify all resources exist and are healthy"
-  echo -e "    ${C}trigger${N}    Inject fault — switch DynamoDB to 2 WCU provisioned"
-  echo -e "    ${C}alarms${N}     Check CloudWatch alarm states"
-  echo -e "    ${C}restore${N}    Undo fault — restore DynamoDB to on-demand"
-  echo -e "    ${C}track${N}      Watch CloudFormation stack events"
-  echo -e "    ${C}cleanup${N}    Tear down all resources (with confirmation)\n"
+  echo -e "    ${C}pre${N}                Check prerequisites (CLI tools, credentials, agent space)"
+  echo -e "    ${C}agent-stack${N}        Provision the AWS DevOps Agent CloudFormation stack first"
+  echo -e "    ${C}deploy${N}             Deploy infrastructure (DynamoDB, Lambda, SNS, Alarms)"
+  echo -e "    ${C}verify${N}             Verify all resources exist and are healthy"
+  echo -e "    ${C}trigger${N}            Inject fault — switch DynamoDB to 2 WCU provisioned"
+  echo -e "    ${C}alarms${N}             Check CloudWatch alarm states"
+  echo -e "    ${C}restore${N}            Undo fault — restore DynamoDB to on-demand"
+  echo -e "    ${C}track${N}              Watch CloudFormation stack events"
+  echo -e "    ${C}cleanup${N}            Tear down all resources (with confirmation)\n"
   echo -e "  ${B}Quick start:${N}"
-  echo -e "    ${D}1.${N} cp .env.example .env       ${D}# configure${N}"
+  echo -e "    ${D}1.${N} cp .env.example .env       ${D}# configure base env${N}"
   echo -e "    ${D}2.${N} $0 pre                     ${D}# check tools & creds${N}"
-  echo -e "    ${D}3.${N} $0 deploy                  ${D}# deploy infra${N}"
-  echo -e "    ${D}4.${N} source .env && python3 scripts/agent_monitor.py  ${D}# terminal 2${N}"
-  echo -e "    ${D}5.${N} $0 trigger                 ${D}# inject incident${N}"
-  echo -e "    ${D}6.${N} $0 restore                 ${D}# undo fault${N}"
-  echo -e "    ${D}7.${N} $0 cleanup                 ${D}# tear down${N}\n"
+  echo -e "    ${D}3.${N} $0 agent-stack             ${D}# provision the AWS DevOps Agent stack first${N}"
+  echo -e "    ${D}4.${N} Edit .env and set WEBHOOK_URL + WEBHOOK_SECRET${D}# then deploy the demo stack${N}"
+  echo -e "    ${D}5.${N} $0 deploy                  ${D}# deploy infra${N}"
+  echo -e "    ${D}6.${N} source .env && python3 scripts/agent_monitor.py  ${D}# terminal 2${N}"
+  echo -e "    ${D}7.${N} $0 trigger                 ${D}# inject incident${N}"
+  echo -e "    ${D}8.${N} $0 restore                 ${D}# undo fault${N}"
+  echo -e "    ${D}9.${N} $0 cleanup                 ${D}# tear down${N}\n"
 }
 
 # ── MAIN ──
@@ -545,6 +647,9 @@ CMD="$1"
 case "$CMD" in
   pre)     pre ;;
   help|-h) usage ;;
+  agent-stack|provision-agent-stack)
+    require_env agent-stack
+    provision_agent_stack ;;
   deploy|trigger|restore|track|verify|cleanup|alarms)
     require_env
     STACK_NAME="${ENV}-devops-agent-demo"

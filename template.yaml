@@ -178,7 +178,7 @@ Resources:
       Timeout: 90
       MemorySize: 128
       # Limit concurrency to prevent runaway invocations
-      ReservedConcurrentExecutions: 5
+      # ReservedConcurrentExecutions: 1
       Code:
         S3Bucket: !Ref LambdaCodeBucket
         S3Key: !Ref AppCodeKey
@@ -353,7 +353,7 @@ Resources:
       Role: !GetAtt WebhookLambdaRole.Arn
       Timeout: 30
       # Limit concurrency to prevent runaway invocations
-      ReservedConcurrentExecutions: 5
+      # ReservedConcurrentExecutions: 1
       DeadLetterConfig:
         TargetArn: !GetAtt WebhookDLQ.Arn
       Code:
