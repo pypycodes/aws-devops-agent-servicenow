@@ -90,14 +90,15 @@ def fetch_journal(cl, sid, eid):
 
 
 def trigger_mitigation(cl, sid, eid):
-    """Send message to the investigation execution to trigger mitigation plan generation.
-    This is the programmatic equivalent of clicking 'Generate mitigation plan' in the console.
+    """Trigger the mitigation plan generation for a completed investigation.
 
-    executionId comes back prefixed like 'exe-ops1-3bc58497-...-8f2a6a0d3f05'. We try the
-    full prefixed id first (this is what the console appears to use, per observed behavior),
-    and only fall back to the bare UUID suffix if that call fails.
+    AWS DevOps Agent returns task.executionId in a prefixed form (for example,
+    'exe-ops1-<uuid>'), but SendMessage validates executionId as a bare UUID.
+    We try the prefixed id first for compatibility, then fall back to the UUID.
 
-    Security: Plans are displayed for human review only — no auto-execution of remediation.
+    The API contract also expects the user action context to be explicit,
+    matching the AWS docs: send_message(..., content="Generate mitigation plan",
+    context={"userActionResponse": "generate_mitigation_plan"}).
     """
     attempts = [("full", eid)]
     stripped = bare_execution_id(eid)
@@ -112,12 +113,16 @@ def trigger_mitigation(cl, sid, eid):
                 agentSpaceId=sid,
                 executionId=exec_id,
                 content="Generate mitigation plan",
+                userId=USER_ID,
+                context={"userActionResponse": "generate_mitigation_plan"},
             )
             return True
         except Exception as e:
             last_err = e
             log(f"{C['r']}send-message failed ({label}): {e}{C['0']}")
 
+    if last_err:
+        log(f"{C['r']}final send-message failure: {last_err}{C['0']}")
     return False
 
 
@@ -149,6 +154,11 @@ def extract_mitigation(records):
     return None
 
 
+def has_mitigation(records):
+    """Return True when an investigation already contains a final mitigation response."""
+    return extract_mitigation(records) is not None
+
+
 # --- Display ---
 
 def banner(sid):
@@ -168,7 +178,121 @@ def show_task(task):
     print(f"  {C['d']}├─{C['0']} Type:     {task['taskType']}")
     print(f"  {C['d']}├─{C['0']} Priority: {task['priority']}")
     print(f"  {C['d']}└─{C['0']} Created:  {task['createdAt']}")
-    print(f"  {C['d']}├─{C['0']} Exec ID:  {task['executionId']}") #added new
+    print(f"  {C['d']}├─{C['0']} Exec ID:  {task['executionId']}")
+
+
+def list_investigations(cl, sid):
+    """Return list of investigations sorted by newest first."""
+    tasks = list_tasks(cl, sid)
+    investigations = [t for t in tasks if t.get("taskType") == "INVESTIGATION"]
+    investigations.sort(key=lambda t: t.get("createdAt", ""), reverse=True)
+    return investigations
+
+
+def show_investigation_detail(cl, sid, task):
+    """Display RCA and mitigation for a single investigation without retriggering."""
+    print(f"\n  {C['c']}Investigation detail{C['0']}")
+    show_task(task)
+    print()
+
+    eid = task.get("executionId")
+    if not eid:
+        print(f"  {C['r']}No executionId available for this investigation.{C['0']}")
+        return
+
+    records = fetch_journal(cl, sid, eid)
+    finding = extract_finding(records)
+    if finding:
+        show_rca(finding)
+    else:
+        print(f"  {C['d']}No root cause finding was found in the journal yet.{C['0']}")
+
+    plan = extract_mitigation(records)
+    if plan:
+        show_mitigation(plan)
+    else:
+        print(f"  {C['d']}No mitigation plan found in the journal for this investigation.{C['0']}")
+
+
+def browse_investigations(cl, sid):
+    """Interactive investigation browser for completed and in-progress tasks."""
+    while True:
+        investigations = list_investigations(cl, sid)
+        if not investigations:
+            print(f"  {C['d']}No investigations found in this agent space.{C['0']}")
+            return
+
+        print(f"\n  {C['c']}Available investigations:{C['0']}")
+        print(f"  {C['d']}Filters: [a]ll  [n]ewest  [i]n_progress  [c]ompleted  [f]ailed  [p]lan  [s]ort  [q]uit{C['0']}")
+
+        filter_choice = input("  filter> ").strip().lower()
+        if filter_choice in ("q", "quit", "exit"):
+            print(f"  {C['d']}Leaving investigation browser.{C['0']}")
+            return
+
+        filtered = investigations
+        if filter_choice in ("n", "newest", "latest"):
+            filtered = investigations[:5]
+        elif filter_choice in ("i", "in_progress"):
+            filtered = [t for t in investigations if t.get("status") == "IN_PROGRESS"]
+        elif filter_choice in ("c", "completed"):
+            filtered = [t for t in investigations if t.get("status") == "COMPLETED"]
+        elif filter_choice in ("f", "failed"):
+            filtered = [t for t in investigations if t.get("status") in ("FAILED", "TIMED_OUT", "CANCELLED")]
+        elif filter_choice in ("p", "plan"):
+            plan_ready = []
+            for task in investigations:
+                eid = task.get("executionId")
+                if not eid:
+                    continue
+                records = fetch_journal(cl, sid, eid)
+                if extract_mitigation(records):
+                    plan_ready.append(task)
+            filtered = plan_ready
+        elif filter_choice in ("s", "sort"):
+            print(f"  {C['d']}Sort by: [t]ime  [s]tatus  [r]eturn to filters{C['0']}")
+            sort_choice = input("  sort> ").strip().lower()
+            if sort_choice in ("t", "time"):
+                investigations = sorted(investigations, key=lambda t: t.get("createdAt", ""), reverse=True)
+            elif sort_choice in ("s", "status"):
+                investigations = sorted(investigations, key=lambda t: (t.get("status", ""), t.get("createdAt", "")), reverse=True)
+            elif sort_choice in ("r", "return"):
+                continue
+            else:
+                print(f"  {C['r']}Unknown sort option. Keeping current order.{C['0']}")
+            filtered = investigations
+        elif filter_choice not in ("", "a", "all"):
+            print(f"  {C['r']}Unknown filter. Showing all investigations.{C['0']}")
+
+        if not filtered:
+            print(f"  {C['d']}No investigations match that filter.{C['0']}")
+            continue
+
+        for i, task in enumerate(filtered, 1):
+            status = task.get("status", "UNKNOWN")
+            title = task.get("title", "Untitled")
+            print(f"  {C['d']}[{i}]{C['0']} {status:>12}  {title}  {C['d']}({task['taskId'][:12]}…){C['0']}")
+
+        print(f"\n  {C['d']}Choose a number to inspect, press m to return to filter menu, or q to quit.{C['0']}")
+        choice = input("  investigation> ").strip().lower()
+        if choice in ("q", "quit", "exit"):
+            print(f"  {C['d']}Leaving investigation browser.{C['0']}")
+            return
+        if choice in ("m", "menu"):
+            continue
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(filtered):
+                show_investigation_detail(cl, sid, filtered[idx - 1])
+                print(f"\n  {C['d']}Press Enter to return to the menu, or q to quit.{C['0']}")
+                next_action = input("  continue> ").strip().lower()
+                if next_action in ("q", "quit", "exit"):
+                    print(f"  {C['d']}Leaving investigation browser.{C['0']}")
+                    return
+            else:
+                print(f"  {C['r']}Invalid choice.{C['0']}")
+        except ValueError:
+            print(f"  {C['r']}Enter a number, m, or q.{C['0']}")
 
 
 def show_rca(finding):
@@ -246,7 +370,8 @@ def run(space_id):
                 if prev and prev != status:
                     log(f"{tid[:12]}… {C['y']}{prev}{C['0']} → {C['g']}{status}{C['0']}")
 
-                # Investigation completed — show RCA, trigger mitigation via send-message
+                # Investigation completed — show RCA and mitigation if already present,
+                # otherwise trigger plan generation via SendMessage.
                 if (ttype == "INVESTIGATION"
                         and status == "COMPLETED"
                         and tid not in handled):
@@ -260,6 +385,13 @@ def run(space_id):
                     finding = extract_finding(records)
                     if finding:
                         show_rca(finding)
+
+                    plan = extract_mitigation(records)
+                    if plan:
+                        log(f"{C['g']}✔ mitigation plan already present in journal{C['0']}")
+                        show_mitigation(plan)
+                        print()
+                        continue
 
                     # Trigger mitigation by sending message to the investigation execution
                     log(f"{C['m']}▶ triggering mitigation for: {tid[:12]}…{C['0']}")
@@ -321,12 +453,27 @@ def select_space(cl):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        space_id = sys.argv[1]
-        if not re.match(r'^[a-f0-9-]{36}$', space_id):
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AWS DevOps Agent investigation monitor")
+    parser.add_argument("space_id", nargs="?", help="Agent space ID")
+    parser.add_argument("--browse", action="store_true", help="List investigations and inspect them interactively")
+    args = parser.parse_args()
+
+    if args.space_id:
+        sid = args.space_id
+        if not re.match(r'^[a-f0-9-]{36}$', sid):
             print(f"  {C['r']}Invalid agent space ID format{C['0']}")
             sys.exit(1)
-        run(space_id)
+        cl = make_client()
+        if args.browse:
+            browse_investigations(cl, sid)
+        else:
+            run(sid)
     else:
         cl = make_client()
-        run(select_space(cl))
+        sid = select_space(cl)
+        if args.browse:
+            browse_investigations(cl, sid)
+        else:
+            run(sid)
