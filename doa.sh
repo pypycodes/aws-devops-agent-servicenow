@@ -537,7 +537,10 @@ cleanup() {
   header "Cleanup"
 
   CONFIG_BUCKET="${ENV}-simple-lambda-config-${ACCOUNT_ID}"
-  STACK_NAME_AGENT=$(aws cloudformation list-stacks --query "StackSummaries[?starts_with(StackName, 'CTDevOpsAgentStack')].StackName" --output text  2>/dev/null || echo "none")
+  STACK_NAME_AGENT=$(aws cloudformation list-stacks \
+    --stack-status-filter CREATE_IN_PROGRESS CREATE_FAILED CREATE_COMPLETE ROLLBACK_IN_PROGRESS ROLLBACK_FAILED ROLLBACK_COMPLETE DELETE_FAILED UPDATE_IN_PROGRESS UPDATE_COMPLETE UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_FAILED UPDATE_ROLLBACK_IN_PROGRESS UPDATE_ROLLBACK_FAILED UPDATE_ROLLBACK_COMPLETE UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS IMPORT_IN_PROGRESS IMPORT_COMPLETE IMPORT_ROLLBACK_IN_PROGRESS IMPORT_ROLLBACK_FAILED IMPORT_ROLLBACK_COMPLETE \
+    --query "StackSummaries[?StackName=='CTDevOpsAgentStack'] | [0].StackName" \
+    --output text --region "$REGION" 2>/dev/null || echo "none")
   # Show cleanup summary
   echo -e "  ${R}${B}⚠ This will permanently delete:${N}"
   echo -e "  ${D}├─${N} Account:  $ACCOUNT_ID"
@@ -593,13 +596,17 @@ if objects:
   aws s3 rb "s3://$BUCKET" --force --region "$REGION" 2>/dev/null && \
     ok "Bucket removed" || warn "Bucket may not exist"
 
-  step "Deleting stack: $STACK_NAME_AGENT"
-  aws cloudformation delete-stack --stack-name "$STACK_NAME_AGENT" --region "$REGION"
-  if spin "Waiting for stack deletion..." \
-    aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME_AGENT" --region "$REGION"; then
-    ok "Stack deleted"
+  if [[ "$STACK_NAME_AGENT" != "none" && "$STACK_NAME_AGENT" != "None" ]]; then
+    step "Deleting stack: $STACK_NAME_AGENT"
+    aws cloudformation delete-stack --stack-name "$STACK_NAME_AGENT" --region "$REGION"
+    if spin "Waiting for stack deletion..." \
+      aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME_AGENT" --region "$REGION"; then
+      ok "Stack deleted"
+    else
+      warn "Stack deletion may still be in progress"
+    fi
   else
-    warn "Stack deletion may still be in progress"
+    warn "Agent stack not found"
   fi
 
   ok "Cleanup complete"

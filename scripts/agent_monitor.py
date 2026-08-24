@@ -14,7 +14,31 @@ import sys
 import textwrap
 from datetime import datetime
 
-REGION = "us-east-1"
+def load_env():
+    """Load the repository .env without overriding existing environment values."""
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+
+    with open(env_path, encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, separator, value = line.partition("=")
+            if not separator or not key.strip():
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            os.environ.setdefault(key.strip(), value)
+
+
+load_env()
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
 POLL_INTERVAL = 30
 WAIT_TIMEOUT = 600
 USER_ID = os.environ.get("USER_ID", "demo-user")
