@@ -7,11 +7,13 @@ Parameters:
     Default: demo
   WebhookUrl:
     Type: String
-    Description: AWS DevOps Agent webhook URL
+    Default: ''
+    Description: AWS DevOps Agent webhook URL (required when EnableServiceNow is false)
   WebhookSecretParam:
     Type: String
+    Default: ''
     NoEcho: true
-    Description: AWS DevOps Agent webhook HMAC secret
+    Description: AWS DevOps Agent webhook HMAC secret (required when EnableServiceNow is false)
   LambdaCodeBucket:
     Type: String
     Description: S3 bucket containing Lambda zip files
@@ -21,6 +23,40 @@ Parameters:
   WebhookCodeKey:
     Type: String
     Default: webhook-lambda.zip
+  ServiceNowIncidentCodeKey:
+    Type: String
+    Default: servicenow-incident-lambda.zip
+  EnableServiceNow:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: When true, deploy the ServiceNow incident Lambda and omit the webhook Lambda. When false, deploy the webhook Lambda only.
+  ServiceNowInstanceUrl:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://[a-zA-Z0-9-]+\.service-now\.com/?$'
+    Description: ServiceNow instance URL
+  ServiceNowClientId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: ServiceNow OAuth client ID
+  ServiceNowClientSecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: ServiceNow OAuth client secret
+  DevOpsAgentNotificationTopicArn:
+    Type: String
+    Default: ''
+    Description: Existing DevOps Agent lifecycle notification topic ARN
+
+Conditions:
+  ServiceNowIncidentEnabled: !Equals [!Ref EnableServiceNow, 'true']
+  WebhookIncidentEnabled: !Not [!Equals [!Ref EnableServiceNow, 'true']]
+  ServiceNowIncidentLifecycleEnabled: !And
+    - !Equals [!Ref EnableServiceNow, 'true']
+    - !Not [!Equals [!Ref DevOpsAgentNotificationTopicArn, '']]
 
 Resources:
 
@@ -172,7 +208,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub '${Env}-simple-lambda'
-      Runtime: python3.11
+      Runtime: python3.14
       Handler: simple_lambda.handler
       Role: !GetAtt LambdaRole.Arn
       Timeout: 90
@@ -292,10 +328,11 @@ Resources:
       OKActions: [ !Ref AlarmTopic ]
 
   # ══════════════════════════════════════════════
-  # Webhook — alarm → AWS DevOps Agent
+  # Webhook — alarm → AWS DevOps Agent (omitted when ServiceNow incidents are enabled)
   # ══════════════════════════════════════════════
   WebhookSecret:
     Type: AWS::SecretsManager::Secret
+    Condition: WebhookIncidentEnabled
     Properties:
       Name: !Sub '${Env}-devops-agent-webhook'
       # Encrypt secret with customer-managed KMS key
@@ -304,6 +341,7 @@ Resources:
 
   WebhookLambdaRole:
     Type: AWS::IAM::Role
+    Condition: WebhookIncidentEnabled
     Properties:
       RoleName: !Sub '${Env}-webhook-lambda-role'
       AssumeRolePolicyDocument:
@@ -318,6 +356,7 @@ Resources:
 
   WebhookSecretsPolicy:
     Type: AWS::IAM::ManagedPolicy
+    Condition: WebhookIncidentEnabled
     Properties:
       ManagedPolicyName: !Sub '${Env}-webhook-secrets-read'
       PolicyDocument:
@@ -338,6 +377,7 @@ Resources:
   # M10/T14: Dead-letter queue — Amazon Simple Queue Service (Amazon SQS) for failed webhook deliveries
   WebhookDLQ:
     Type: AWS::SQS::Queue
+    Condition: WebhookIncidentEnabled
     Properties:
       QueueName: !Sub '${Env}-webhook-dlq'
       SqsManagedSseEnabled: false
@@ -346,9 +386,10 @@ Resources:
 
   WebhookFunction:
     Type: AWS::Lambda::Function
+    Condition: WebhookIncidentEnabled
     Properties:
       FunctionName: !Sub '${Env}-devops-agent-webhook'
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x  
       Handler: index.handler
       Role: !GetAtt WebhookLambdaRole.Arn
       Timeout: 30
@@ -365,25 +406,113 @@ Resources:
 
   WebhookLogGroup:
     Type: AWS::Logs::LogGroup
+    Condition: WebhookIncidentEnabled
     Properties:
       LogGroupName: !Sub '/aws/lambda/${Env}-devops-agent-webhook'
       RetentionInDays: 14
       KmsKeyId: !GetAtt DemoKey.Arn
 
-  WebhookSnsPermission:
+  WebhookPermission:
     Type: AWS::Lambda::Permission
+    Condition: WebhookIncidentEnabled
     Properties:
       FunctionName: !Ref WebhookFunction
       Action: lambda:InvokeFunction
       Principal: sns.amazonaws.com
       SourceArn: !Ref AlarmTopic
 
-  WebhookSubscription:
+  WebhookAlarmSubscription:
     Type: AWS::SNS::Subscription
+    Condition: WebhookIncidentEnabled
     Properties:
       TopicArn: !Ref AlarmTopic
       Protocol: lambda
       Endpoint: !GetAtt WebhookFunction.Arn
+
+  ServiceNowIncidentRole:
+    Type: AWS::IAM::Role
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      RoleName: !Sub '${Env}-servicenow-incident-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DecryptAlarmTopic
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DemoKey.Arn
+
+  ServiceNowIncidentFunction:
+    Type: AWS::Lambda::Function
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      FunctionName: !Sub '${Env}-servicenow-incident'
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt ServiceNowIncidentRole.Arn
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref ServiceNowIncidentCodeKey
+      Environment:
+        Variables:
+          SERVICENOW_INSTANCE_URL: !Ref ServiceNowInstanceUrl
+          SERVICENOW_CLIENT_ID: !Ref ServiceNowClientId
+          SERVICENOW_CLIENT_SECRET: !Ref ServiceNowClientSecret
+
+  ServiceNowIncidentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Env}-servicenow-incident'
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt DemoKey.Arn
+
+  ServiceNowIncidentPermission:
+    Type: AWS::Lambda::Permission
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      FunctionName: !Ref ServiceNowIncidentFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlarmTopic
+
+  ServiceNowIncidentSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: ServiceNowIncidentLifecycleEnabled
+    Properties:
+      TopicArn: !Ref DevOpsAgentNotificationTopicArn
+      Protocol: lambda
+      Endpoint: !GetAtt ServiceNowIncidentFunction.Arn
+
+  ServiceNowIncidentAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ServiceNowIncidentFunction.Arn
+
+  ServiceNowIncidentLifecyclePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ServiceNowIncidentLifecycleEnabled
+    Properties:
+      FunctionName: !Ref ServiceNowIncidentFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref DevOpsAgentNotificationTopicArn
 
 Outputs:
   TableName:

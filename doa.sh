@@ -1,665 +1,525 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
 
-# Colors
-G='\033[38;5;114m' Y='\033[38;5;222m' C='\033[38;5;117m' R='\033[38;5;210m' D='\033[38;5;243m' B='\033[1m' N='\033[0m'
+# Prevent AWS CLI from opening less or prompting interactively.
+export AWS_PAGER=""
+export AWS_CLI_AUTO_PROMPT=off
 
-# Load .env if present
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
-  set -a; source "$SCRIPT_DIR/.env"; set +a
+# Colours
+G='\033[38;5;114m'; Y='\033[38;5;222m'; C='\033[38;5;117m'
+R='\033[38;5;210m'; D='\033[38;5;243m'; B='\033[1m'; N='\033[0m'
+
+step() { echo -e "  ${C}▸${N} $1"; }
+ok()   { echo -e "  ${G}✔${N} $1"; }
+warn() { echo -e "  ${Y}⚠${N} $1"; }
+fail() { echo -e "  ${R}✘${N} $1" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+
+  AWS DevOps Agent Demo
+
+  Usage: $0 <command>
+
+  Commands:
+    pre          Check prerequisites
+    agent-stack  Provision the AWS DevOps Agent stack
+    deploy       Deploy the demo infrastructure only
+    verify       Verify resources
+    trigger      Set DynamoDB max writes to 2 and invoke Lambda
+    alarms       Show CloudWatch alarm states
+    restore      Remove the DynamoDB maximum write limit
+    track        Show CloudFormation stack status and outputs
+    cleanup      Delete demo resources
+    help         Show this help
+EOF
+}
+
+trap 'echo -e "\n  ${R}✘${N} Failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+
+if (( $# == 0 )); then usage; exit 0; fi
+case "$1" in
+  help|-h|--help) usage; exit 0 ;;
+esac
+
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
 else
-  echo -e "\n  ${R}✘${N} .env file not found. Create one from the template:"
-  echo -e "  ${D}    cp .env.example .env${N}"
-  echo -e "  ${D}    # Then edit .env with your values${N}\n"
+  echo -e "\n  ${R}✘${N} .env file not found. Create it first:"
+  echo -e "  ${D}cp .env.example .env${N}\n"
   exit 1
 fi
 
 REGION="${AWS_REGION:-us-east-1}"
+ACCOUNT_ID=""
+BUCKET=""
+STACK_NAME=""
 
-# Require ENV to be set (except for pre and help)
-# Require webhook settings only for later operational steps, not the initial agent stack deployment
+servicenow_incidents_enabled() {
+  [[ "${ENABLE_SERVICENOW:-false}" == "true" ]]
+}
+
 require_env() {
   local mode="${1:-full}"
   local missing=()
-  [[ -z "${ENV:-}" ]] && missing+=("ENV")
-  [[ -z "${AWS_PROFILE:-}" ]] && missing+=("AWS_PROFILE")
-  if [[ "$mode" != "agent-stack" ]]; then
-    [[ -z "${WEBHOOK_URL:-}" ]] && missing+=("WEBHOOK_URL")
-    [[ -z "${WEBHOOK_SECRET:-}" ]] && missing+=("WEBHOOK_SECRET")
+
+  [[ -n "${ENV:-}" ]] || missing+=(ENV)
+  [[ -n "${AWS_PROFILE:-}" ]] || missing+=(AWS_PROFILE)
+
+  if [[ "$mode" != "agent-stack" ]] && ! servicenow_incidents_enabled; then
+    [[ -n "${WEBHOOK_URL:-}" ]] || missing+=(WEBHOOK_URL)
+    [[ -n "${WEBHOOK_SECRET:-}" ]] || missing+=(WEBHOOK_SECRET)
   fi
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    echo -e "  ${R}✘${N} Missing required values in .env: ${missing[*]}"
-    exit 1
+
+  if (( ${#missing[@]} > 0 )); then
+    fail "Missing required values in .env: ${missing[*]}"
   fi
 }
 
-# Lazy-load account ID (only when needed)
+validate_webhook_config() {
+  local secret_fingerprint
+
+  [[ -n "${WEBHOOK_URL:-}" ]] || fail "WEBHOOK_URL is empty in $ENV_FILE"
+  [[ "$WEBHOOK_URL" == https://* ]] || fail "WEBHOOK_URL must use HTTPS"
+  [[ -n "${WEBHOOK_SECRET:-}" ]] || fail "WEBHOOK_SECRET is empty in $ENV_FILE"
+
+  secret_fingerprint="$(printf '%s' "$WEBHOOK_SECRET" | sha256sum | awk '{print substr($1,1,12)}')"
+  echo -e "  ${D}Webhook configuration:${N} $ENV_FILE"
+  echo -e "  ${D}Webhook host:${N} ${WEBHOOK_URL%%/webhook/*}/webhook/<redacted>"
+  echo -e "  ${D}Secret fingerprint:${N} $secret_fingerprint"
+}
+
+validate_servicenow_config() {
+  local enabled="${1:-${ENABLE_SERVICENOW:-false}}"
+  [[ "$enabled" == "true" ]] || return 0
+
+  [[ -n "${SERVICENOW_INSTANCE_URL:-}" ]] || fail "SERVICENOW_INSTANCE_URL is required"
+  [[ "$SERVICENOW_INSTANCE_URL" =~ ^https://[^/]+\.service-now\.com/?$ ]] || \
+    fail "SERVICENOW_INSTANCE_URL must match https://<instance>.service-now.com"
+  [[ -n "${SERVICENOW_CLIENT_ID:-}" ]] || fail "SERVICENOW_CLIENT_ID is required"
+  [[ -n "${SERVICENOW_CLIENT_SECRET:-}" ]] || fail "SERVICENOW_CLIENT_SECRET is required"
+  [[ -n "${SERVICENOW_INSTANCE_ID:-}" ]] || fail "SERVICENOW_INSTANCE_ID is required"
+
+  echo -e "  ${D}ServiceNow:${N} enabled (${SERVICENOW_INSTANCE_URL})"
+}
+
 init() {
-  if [[ -z "${ACCOUNT_ID:-}" ]]; then
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+  if [[ -z "$ACCOUNT_ID" ]]; then
+    ACCOUNT_ID="$(aws sts get-caller-identity --region "$REGION" --query Account --output text --no-cli-pager)" || \
+      fail "Unable to read AWS account identity for profile ${AWS_PROFILE:-default}"
     BUCKET="${ENV}-devops-agent-demo-${ACCOUNT_ID}"
+    STACK_NAME="${ENV}-devops-agent-demo"
   fi
 }
 
 header() {
   echo -e "\n  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${C}┃${N}  ${B}AWS DevOps Agent Demo${N} — $1"
+  echo -e "  ${C}┃${N}  ${B}AWS DevOps Agent Demo${N} - $1"
   echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${D}Region:${N} $REGION  ${D}Env:${N} $ENV  ${D}Account:${N} ${ACCOUNT_ID:-unknown}\n"
+  echo -e "  ${D}Region:${N} $REGION  ${D}Env:${N} ${ENV:-unset}  ${D}Account:${N} ${ACCOUNT_ID:-unknown}\n"
 }
 
-step() { echo -e "  ${C}▸${N} $1"; }
-ok()   { echo -e "  ${G}✔${N} $1"; }
-fail() { echo -e "  ${R}✘${N} $1"; exit 1; }
-warn() { echo -e "  ${Y}⚠${N} $1"; }
-
-# Run a command with a spinner animation
+# Run a command with a spinner. The command's output is stored in a temporary log,
+# and printed if the command fails. i=$((i+1)) is used because ((i++)) can return
+# status 1 on its first run and terminate scripts using set -e.
 spin() {
   local msg="$1"; shift
+  local log_file pid rc i=0
   local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-  "$@" &>/dev/null &
-  local pid=$!
-  local i=0
+
+  log_file="$(mktemp)"
+  "$@" >"$log_file" 2>&1 &
+  pid=$!
+
   while kill -0 "$pid" 2>/dev/null; do
-    printf "\r  ${C}${frames[$((i % ${#frames[@]}))]}${N} %s" "$msg"
+    printf "\r  ${C}%s${N} %s" "${frames[$((i % ${#frames[@]}))]}" "$msg"
     sleep 0.1
-    ((i++))
+    i=$((i + 1))
   done
-  wait "$pid"
-  local rc=$?
-  printf "\r%*s\r" $((${#msg} + 6)) ""
-  return $rc
+
+  if wait "$pid"; then rc=0; else rc=$?; fi
+  printf "\r%*s\r" "$(( ${#msg} + 8 ))" ""
+
+  if (( rc != 0 )); then
+    cat "$log_file" >&2
+  fi
+  rm -f "$log_file"
+  return "$rc"
 }
 
-# ── PRE: Prerequisites Check ──
 pre() {
-  echo -e "\n  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${C}┃${N}  ${B}AWS DevOps Agent Demo${N} — Prerequisites"
-  echo -e "  ${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}\n"
+  header "Prerequisites"
+  local passed=0 total=0 tool
 
-  PASS=0; TOTAL=0
-  MISSING=()
-
-  # Generic: check command, prompt to install if missing
-  ensure() {
-    local tool="$1" install_cmd="$2" link="$3"
-    TOTAL=$((TOTAL + 1))
-    if command -v "$tool" &>/dev/null; then
-      ok "$tool $(command -v "$tool")"; PASS=$((PASS + 1)); return
-    fi
-    echo -e "  ${Y}⚠${N} $tool not found"
-    [[ -n "$link" ]] && echo -e "  ${D}  Install guide: $link${N}"
-    read -rp "  Install $tool now? [y/N] " answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-      step "Installing $tool..."
-      if eval "$install_cmd"; then ok "$tool installed"; PASS=$((PASS + 1))
-      else echo -e "  ${R}✘${N} Failed to install $tool"; fi
+  for tool in aws python3 zip jq; do
+    total=$((total + 1))
+    if command -v "$tool" >/dev/null 2>&1; then
+      ok "$tool: $(command -v "$tool")"
+      passed=$((passed + 1))
     else
-      echo -e "  ${R}✘${N} $tool required"
+      warn "$tool is not installed"
     fi
-  }
+  done
 
-  # For tools that should not be auto-installed (e.g. python3 — tzdata prompt issues)
-  ensure_manual() {
-    local tool="$1" link="$2"
-    TOTAL=$((TOTAL + 1))
-    if command -v "$tool" &>/dev/null; then
-      ok "$tool $(command -v "$tool")"; PASS=$((PASS + 1)); return
-    fi
-    echo -e "  ${R}✘${N} $tool not found — install manually: $link"
-    MISSING+=("$tool")
-  }
-
-  # Package manager install helper
-  pkg() {
-    local SUDO=""; command -v sudo &>/dev/null && SUDO="sudo"
-    if command -v brew &>/dev/null; then brew install "$1"
-    elif command -v apt-get &>/dev/null; then export DEBIAN_FRONTEND=noninteractive; ${SUDO:+$SUDO -E} apt-get update && ${SUDO:+$SUDO -E} apt-get install -y "$1"
-    elif command -v yum &>/dev/null; then $SUDO yum install -y "$1"
-    elif command -v dnf &>/dev/null; then $SUDO dnf install -y "$1"
-    else return 1; fi
-  }
-
-  # AWS CLI install (cross-platform)
-  install_awscli() {
-    local SUDO=""; command -v sudo &>/dev/null && SUDO="sudo"
-    if [[ "$(uname)" == "Darwin" ]]; then
-      curl -sL "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o /tmp/AWSCLIV2.pkg && $SUDO installer -pkg /tmp/AWSCLIV2.pkg -target /
-    else
-      $SUDO apt-get update -qq 2>/dev/null; $SUDO apt-get install -y -qq curl unzip 2>/dev/null || true
-      curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip \
-        && unzip -qo /tmp/awscliv2.zip -d /tmp && $SUDO /tmp/aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
-    fi
-  }
-
-  step "Checking required tools..."
-  ensure aws     "install_awscli" "https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html"
-  ensure_manual python3          "https://www.python.org/downloads/"
-  ensure zip     "pkg zip"       "https://linux.die.net/man/1/zip"
-  ensure jq      "pkg jq"        "https://jqlang.org/download/"
-
-  if [[ ${#MISSING[@]} -gt 0 ]]; then
-    echo ""
-    echo -e "  ${R}Missing: ${MISSING[*]}${N}"
-    echo -e "  ${D}Install and re-run: ./doa.sh pre${N}"
-    exit 1
-  fi
-
-  # Python version
-  TOTAL=$((TOTAL + 1))
-  PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
-  if [[ "${PY_VER%%.*}" -ge 3 && "${PY_VER##*.}" -ge 11 ]]; then
-    ok "Python $PY_VER"; PASS=$((PASS + 1))
+  total=$((total + 1))
+  if python3 - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+  then
+    ok "Python $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
+    passed=$((passed + 1))
   else
-    echo -e "  ${R}✘${N} Python $PY_VER — need 3.11+ (https://www.python.org/downloads/)"
+    warn "Python 3.11 or newer is required"
   fi
 
-  # boto3
-  TOTAL=$((TOTAL + 1))
-  if python3 -c "import boto3" &>/dev/null; then
-    ok "boto3 available"; PASS=$((PASS + 1))
+  total=$((total + 1))
+  if python3 -c 'import boto3' >/dev/null 2>&1; then
+    ok "boto3 available"
+    passed=$((passed + 1))
   else
-    echo -e "  ${Y}⚠${N} boto3 not found"
-    read -rp "  Install boto3 now? [y/N] " answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-      step "Installing boto3..."
-      if pkg python3-boto3 2>/dev/null || pip3 install --break-system-packages boto3 2>/dev/null || pip3 install boto3 2>/dev/null; then
-        ok "boto3 installed"; PASS=$((PASS + 1))
-      else
-        echo -e "  ${R}✘${N} Failed — run manually: pip3 install boto3"
-      fi
-    else
-      echo -e "  ${R}✘${N} boto3 required — run: pip3 install boto3"
-    fi
+    warn "boto3 is missing: python3 -m pip install boto3"
   fi
 
-  echo ""
-  if [[ $PASS -eq $TOTAL ]]; then
-    ok "${G}All ${PASS}/${TOTAL} tools installed${N}"
+  if aws sts get-caller-identity --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    ok "AWS credentials are valid"
   else
-    warn "${Y}${PASS}/${TOTAL} tools installed${N}"
+    warn "AWS credentials are not available. For SSO run: aws sso login --profile $AWS_PROFILE"
   fi
 
-  # ── Next Steps (not counted in pass/total) ──
-  echo -e "\n  ${B}Next steps:${N}"
-
-  if aws sts get-caller-identity &>/dev/null; then
-    ok "AWS credentials configured"
-  else
-    echo -e "  ${Y}☐${N} Configure AWS credentials:"
-    echo -e "  ${D}    aws configure${N}"
-    echo -e "  ${D}    # Enter your AWS Access Key ID, Secret Access Key, and default region (us-east-1)${N}"
-  fi
-
-  SPACES=$(aws devops-agent list-agent-spaces --region "$REGION" --output json 2>/dev/null || echo '{"agentSpaces":[]}')
-  SPACE_COUNT=$(echo "$SPACES" | jq '.agentSpaces | length')
-  if [[ "$SPACE_COUNT" -gt 0 ]]; then
-    ok "$SPACE_COUNT agent space(s) found"
-  else
-    echo -e "  ${Y}☐${N} Create a AWS DevOps Agent space:"
-    echo -e "  ${D}    https://docs.aws.amazon.com/devopsagent/latest/userguide/getting-started-with-aws-devops-agent-cli-onboarding-guide.html${N}"
-  fi
-
-  if [[ -n "${WEBHOOK_URL:-}" && -n "${WEBHOOK_SECRET:-}" ]]; then
-    ok "WEBHOOK_URL and WEBHOOK_SECRET set"
-  else
-    echo -e "  ${Y}☐${N} Set webhook credentials:"
-    echo -e "  ${D}    export WEBHOOK_URL=https://...${N}"
-    echo -e "  ${D}    export WEBHOOK_SECRET=your-secret${N}"
-  fi
-
-  echo -e "\n  ${B}Ready to provision the agent stack? Run:${N}"
-  echo -e "  ${D}    export ENV=dev${N}"
-  echo -e "  ${D}    export AWS_REGION=us-east-1${N}"
-  echo -e "  ${D}    ./doa.sh agent-stack   # Creates the AWS DevOps Agent space / CloudFormation stack${N}"
-  echo -e "  ${D}    # Then add WEBHOOK_URL and WEBHOOK_SECRET to .env, and run:${N}"
-  echo -e "  ${D}    ./doa.sh deploy        # Sets up DynamoDB, Lambda, EventBridge, SNS, CloudWatch Alarms${N}"
-  echo ""
+  echo
+  if (( passed == total )); then ok "All $passed/$total prerequisites passed"
+  else warn "$passed/$total prerequisites passed"; fi
 }
 
-# ── PROVISION DEVOPS AGENT STACK ──
 provision_agent_stack() {
   init
+  validate_servicenow_config "${ENABLE_SERVICENOW:-false}"
   header "Provision DevOps Agent Stack"
 
-  STACK_NAME_AGENT="CTDevOpsAgentStack"
-  AGENT_SPACE_NAME="${ENV}-CTDevOpsAgentSpace"
+  local agent_stack="CTDevOpsAgentStack"
+  local agent_space_name="${ENV}-CTDevOpsAgentSpace"
+  local confirm
 
-  echo -e "  ${B}Agent Stack Target${N}"
-  echo -e "  ${D}├─${N} Account:     $ACCOUNT_ID"
-  echo -e "  ${D}├─${N} Region:      $REGION"
-  echo -e "  ${D}├─${N} Stack:       $STACK_NAME_AGENT"
-  echo -e "  ${D}└─${N} Agent Space: $AGENT_SPACE_NAME"
-  echo
+  echo -e "  ${D}Account:${N} $ACCOUNT_ID"
+  echo -e "  ${D}Region:${N} $REGION"
+  echo -e "  ${D}Stack:${N} $agent_stack"
+  echo -e "  ${D}Agent space:${N} $agent_space_name"
   read -rp "  Proceed? [y/N] " confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || { echo -e "  ${D}Aborted.${N}"; exit 0; }
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
 
-  step "Deploying CloudFormation stack: $STACK_NAME_AGENT"
-  if spin "Provisioning DevOps agent stack..." \
+  if spin "Provisioning DevOps Agent stack..." \
     aws cloudformation deploy \
       --template-file "$SCRIPT_DIR/devops-agent-stack.yaml" \
-      --stack-name "$STACK_NAME_AGENT" \
+      --stack-name "$agent_stack" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides \
-        AgentSpaceName="$AGENT_SPACE_NAME" \
+        AgentSpaceName="$agent_space_name" \
         AgentSpaceDescription="Agent space deployed with CloudFormation for ${ENV} CT DevOpsAgent Demo" \
-      --region "$REGION" \
-      --no-fail-on-empty-changeset; then
+        EnableServiceNow="${ENABLE_SERVICENOW:-false}" \
+        ServiceNowInstanceUrl="${SERVICENOW_INSTANCE_URL:-}" \
+        ServiceNowClientName="${SERVICENOW_CLIENT_NAME:-AWS DevOps Agent ServiceNow Integration}" \
+        ServiceNowClientId="${SERVICENOW_CLIENT_ID:-}" \
+        ServiceNowClientSecret="${SERVICENOW_CLIENT_SECRET:-}" \
+        ServiceNowInstanceId="${SERVICENOW_INSTANCE_ID:-}" \
+        NotificationEmail="${NOTIFICATION_EMAIL:-}" \
+      --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
     ok "Agent stack provisioned"
   else
-    fail "DevOps agent stack deployment failed. Run: aws cloudformation describe-stack-events --stack-name $STACK_NAME_AGENT --region $REGION"
+    fail "Agent stack deployment failed"
   fi
-
-  step "Checking agent space registration..."
-  aws devops-agent list-agent-spaces --region "$REGION" --query "agentSpaces[?name=='${AGENT_SPACE_NAME}'].[agentSpaceId,name]" --output table 2>/dev/null || true
-  echo -e "\n  ${B}Next step:${N}"
-  echo -e "  ${D}1.${N} Edit .env and set WEBHOOK_URL and WEBHOOK_SECRET${N}"
-  echo -e "  ${D}2.${N} Run: ./doa.sh deploy${N}"
-  echo ""
 }
 
-# ── DEPLOY: Infrastructure ──
 deploy() {
+  if servicenow_incidents_enabled; then
+    validate_servicenow_config
+  else
+    validate_webhook_config
+  fi
   init
-  provision_agent_stack
   header "Deploy Infrastructure"
 
-  # Show deployment summary
-  AGENT_SPACE=$(aws devops-agent list-agent-spaces --region "$REGION" --query 'agentSpaces[0].{id:agentSpaceId,name:name}' --output text 2>/dev/null || echo "none")
-  STACK_NAME_AGENT=$(aws cloudformation list-stacks --query "StackSummaries[?starts_with(StackName, 'CTDevOpsAgent')].StackName" --output text  2>/dev/null || echo "none")
-  echo -e "  ${B}Deployment Target${N}"
-  echo -e "  ${D}├─${N} Account:     $ACCOUNT_ID"
-  echo -e "  ${D}├─${N} Region:      $REGION"
-  echo -e "  ${D}├─${N} Agent Space: $AGENT_SPACE"
-  echo -e "  ${D}└─${N} InfraStack:       $STACK_NAME"
-  # echo -e "  ${D}└─${N} AgentStack:       $STACK_NAME_AGENT"
-  echo
-  read -rp "  Proceed? [y/N] " confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || { echo -e "  ${D}Aborted.${N}"; exit 0; }
+  local confirm agent_topic_arn
+  read -rp "  Deploy $STACK_NAME in account $ACCOUNT_ID? [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
 
   step "Creating code bucket: $BUCKET"
-  aws s3 mb "s3://$BUCKET" --region "$REGION" 2>/dev/null && ok "Bucket created" || ok "Bucket exists"
+  if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1; then
+    ok "Bucket exists"
+  else
+    if [[ "$REGION" == "us-east-1" ]]; then
+      aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" --no-cli-pager >/dev/null
+    else
+      aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+        --create-bucket-configuration "LocationConstraint=$REGION" --no-cli-pager >/dev/null
+    fi
+    ok "Bucket created"
+  fi
 
-  step "Packaging app Lambda..."
-  (cd "$SCRIPT_DIR/lambdas/app" && zip -q /tmp/simple-lambda.zip simple_lambda.py)
-  aws s3 cp /tmp/simple-lambda.zip "s3://$BUCKET/simple-lambda.zip" --quiet
-  ok "simple-lambda.zip uploaded"
+  step "Packaging and uploading Lambda functions"
+  (cd "$SCRIPT_DIR/lambdas/app" && zip -q -j /tmp/simple-lambda.zip simple_lambda.py)
+  aws s3 cp /tmp/simple-lambda.zip "s3://$BUCKET/simple-lambda.zip" --region "$REGION" --quiet
+  if servicenow_incidents_enabled; then
+    (cd "$SCRIPT_DIR/lambdas/servicenow-incident" && zip -q -j /tmp/servicenow-incident-lambda.zip index.mjs)
+    aws s3 cp /tmp/servicenow-incident-lambda.zip "s3://$BUCKET/servicenow-incident-lambda.zip" --region "$REGION" --quiet
+    echo -e "  ${D}Alarm trigger:${N} ServiceNow incident Lambda (webhook Lambda omitted)"
+  else
+    (cd "$SCRIPT_DIR/lambdas/webhook" && zip -q -j /tmp/webhook-lambda.zip index.mjs)
+    aws s3 cp /tmp/webhook-lambda.zip "s3://$BUCKET/webhook-lambda.zip" --region "$REGION" --quiet
+    echo -e "  ${D}Alarm trigger:${N} webhook Lambda → DevOps Agent (ServiceNow incident Lambda omitted)"
+  fi
+  ok "Lambda packages uploaded"
 
-  step "Packaging webhook Lambda..."
-  (cd "$SCRIPT_DIR/lambdas/webhook" && zip -q /tmp/webhook-lambda.zip index.mjs)
-  aws s3 cp /tmp/webhook-lambda.zip "s3://$BUCKET/webhook-lambda.zip" --quiet
-  ok "webhook-lambda.zip uploaded"
+  agent_topic_arn="$(aws cloudformation describe-stacks \
+    --stack-name CTDevOpsAgentStack --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='DevOpsAgentNotificationTopicArn'].OutputValue | [0]" \
+    --output text --no-cli-pager 2>/dev/null || true)"
+  [[ "$agent_topic_arn" == "None" ]] && agent_topic_arn=""
 
-  step "Deploying CloudFormation stack..."
-  if spin "Deploying stack (this takes ~2 min)..." \
+  if spin "Deploying infrastructure stack..." \
     aws cloudformation deploy \
       --template-file "$SCRIPT_DIR/template.yaml" \
       --stack-name "$STACK_NAME" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides \
-        Env="$ENV" \
-        WebhookUrl="$WEBHOOK_URL" \
-        WebhookSecretParam="$WEBHOOK_SECRET" \
-        LambdaCodeBucket="$BUCKET" \
-        AppCodeKey=simple-lambda.zip \
+        Env="$ENV" WebhookUrl="${WEBHOOK_URL:-}" WebhookSecretParam="${WEBHOOK_SECRET:-}" \
+        LambdaCodeBucket="$BUCKET" AppCodeKey=simple-lambda.zip \
         WebhookCodeKey=webhook-lambda.zip \
-      --region "$REGION" \
-      --no-fail-on-empty-changeset; then
-    ok "Stack deployed"
+        ServiceNowIncidentCodeKey=servicenow-incident-lambda.zip \
+        EnableServiceNow="${ENABLE_SERVICENOW:-false}" \
+        ServiceNowInstanceUrl="${SERVICENOW_INSTANCE_URL:-}" \
+        ServiceNowClientId="${SERVICENOW_CLIENT_ID:-}" \
+        ServiceNowClientSecret="${SERVICENOW_CLIENT_SECRET:-}" \
+        DevOpsAgentNotificationTopicArn="$agent_topic_arn" \
+      --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
+    ok "Infrastructure stack deployed"
   else
-    fail "Stack deployment failed. Run: aws cloudformation describe-stack-events --stack-name $STACK_NAME --region $REGION"
+    fail "Infrastructure stack deployment failed"
   fi
 
-  track
   verify
-
-  echo -e "  ${B}Next step — start the monitor and inject the fault:${N}"
-  echo -e "  ${D}    python3 scripts/agent_monitor.py   # Terminal 1: watch investigations${N}"
-  echo -e "  ${D}    ./doa.sh trigger                   # Terminal 2: inject DynamoDB throttling${N}"
-  echo ""
 }
 
-# ── TRACK ──
 track() {
   init
-  header "Stack Progress"
-
-  STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
-    --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
-
-  if [[ "$STATUS" == *"IN_PROGRESS"* ]]; then
-    step "Stack is ${Y}${STATUS}${N} — watching events..."
-    echo ""
-    aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME" --region "$REGION" 2>/dev/null &
-    WAIT_PID=$!
-
-    SEEN=""
-    while kill -0 $WAIT_PID 2>/dev/null; do
-      EVENTS=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$REGION" \
-        --query "StackEvents[?ResourceStatus!='CREATE_IN_PROGRESS'].[Timestamp,LogicalResourceId,ResourceStatus]" \
-        --output text 2>/dev/null | head -20)
-      while IFS=$'\t' read -r ts resource status; do
-        KEY="${resource}:${status}"
-        if [[ ! "$SEEN" == *"$KEY"* ]]; then
-          SEEN="$SEEN $KEY"
-          case "$status" in
-            *COMPLETE)   ok "${D}${ts}${N}  ${resource} → ${G}${status}${N}" ;;
-            *FAILED)     fail "${D}${ts}${N}  ${resource} → ${R}${status}${N}" ;;
-            *ROLLBACK*)  warn "${D}${ts}${N}  ${resource} → ${Y}${status}${N}" ;;
-          esac
-        fi
-      done <<< "$EVENTS"
-      sleep 5
-    done
-    echo ""
-  fi
-
-  STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
-    --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
-
-  case "$STATUS" in
-    *COMPLETE)    ok "Stack status: ${G}${STATUS}${N}" ;;
-    *FAILED|*ROLLBACK*) fail "Stack status: ${R}${STATUS}${N}" ;;
-    NOT_FOUND)    warn "Stack not found" ;;
-    *)            step "Stack status: ${Y}${STATUS}${N}" ;;
-  esac
-
-  echo ""
+  header "Stack Status"
   aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
-    --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table 2>/dev/null || true
+    --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' --output json --no-cli-pager
 }
 
-# ── VERIFY ──
 verify() {
   init
   header "Resource Verification"
-
-  PASS=0; TOTAL=0
+  local passed=0 total=0 sub_count
 
   check() {
-    TOTAL=$((TOTAL + 1))
     local label="$1"; shift
-    if "$@" &>/dev/null; then
-      ok "$label"; PASS=$((PASS + 1))
-    else
-      echo -e "  ${R}✘${N} $label"
-    fi
+    total=$((total + 1))
+    if "$@" >/dev/null 2>&1; then ok "$label"; passed=$((passed + 1)); else warn "$label"; fi
   }
 
-  check "DynamoDB table: ${ENV}-stress-test-table" \
-    aws dynamodb describe-table --table-name "${ENV}-stress-test-table" --region "$REGION"
+  # shellcheck disable=SC2317 # Invoked indirectly via check().
+  lambda_absent() {
+    ! aws lambda get-function --function-name "$1" --region "$REGION" --no-cli-pager
+  }
 
-  check "S3 bucket: ${ENV}-simple-lambda-config-${ACCOUNT_ID}" \
-    aws s3api head-bucket --bucket "${ENV}-simple-lambda-config-${ACCOUNT_ID}" --region "$REGION"
-
-  check "Lambda: ${ENV}-simple-lambda" \
-    aws lambda get-function --function-name "${ENV}-simple-lambda" --region "$REGION"
-
-  check "Lambda: ${ENV}-devops-agent-webhook" \
-    aws lambda get-function --function-name "${ENV}-devops-agent-webhook" --region "$REGION"
-
-  check "EventBridge: ${ENV}-simple-lambda-schedule" \
-    aws events describe-rule --name "${ENV}-simple-lambda-schedule" --region "$REGION"
-
-  check "SNS topic: ${ENV}-devops-agent-alarms" \
-    aws sns get-topic-attributes --topic-arn "arn:aws:sns:${REGION}:${ACCOUNT_ID}:${ENV}-devops-agent-alarms" --region "$REGION"
-
-  check "Secret: ${ENV}-devops-agent-webhook" \
-    aws secretsmanager describe-secret --secret-id "${ENV}-devops-agent-webhook" --region "$REGION"
-
-  check "Alarm: ${ENV}-DynamoDB-WriteThrottle" \
-    aws cloudwatch describe-alarms --alarm-names "${ENV}-DynamoDB-WriteThrottle" --region "$REGION" \
-    --query "MetricAlarms[0].AlarmName" --output text
-
-  check "Alarm: ${ENV}-Lambda-Errors" \
-    aws cloudwatch describe-alarms --alarm-names "${ENV}-Lambda-Errors" --region "$REGION" \
-    --query "MetricAlarms[0].AlarmName" --output text
-
-  SUB_COUNT=$(aws sns list-subscriptions-by-topic \
-    --topic-arn "arn:aws:sns:${REGION}:${ACCOUNT_ID}:${ENV}-devops-agent-alarms" \
-    --region "$REGION" --query "length(Subscriptions)" --output text 2>/dev/null || echo "0")
-  check "SNS → Lambda subscription (${SUB_COUNT})" \
-    test "$SUB_COUNT" -gt 0
-
-  check "Log group: /aws/lambda/${ENV}-simple-lambda" \
-    aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/${ENV}-simple-lambda" \
-    --region "$REGION" --query "logGroups[0].logGroupName" --output text
-
-  check "Log group: /aws/lambda/${ENV}-devops-agent-webhook" \
-    aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/${ENV}-devops-agent-webhook" \
-    --region "$REGION" --query "logGroups[0].logGroupName" --output text
-
-  echo ""
-  if [[ $PASS -eq $TOTAL ]]; then
-    ok "${G}All ${PASS}/${TOTAL} resources verified${N}"
+  check "DynamoDB: ${ENV}-stress-test-table" aws dynamodb describe-table --table-name "${ENV}-stress-test-table" --region "$REGION" --no-cli-pager
+  check "S3: ${ENV}-simple-lambda-config-${ACCOUNT_ID}" aws s3api head-bucket --bucket "${ENV}-simple-lambda-config-${ACCOUNT_ID}" --region "$REGION"
+  check "Lambda: ${ENV}-simple-lambda" aws lambda get-function --function-name "${ENV}-simple-lambda" --region "$REGION" --no-cli-pager
+  check "Log group: /aws/lambda/${ENV}-simple-lambda" aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/${ENV}-simple-lambda" --region "$REGION" --query 'logGroups[0].logGroupName' --output text --no-cli-pager
+  if servicenow_incidents_enabled; then
+    check "Lambda: ${ENV}-servicenow-incident" aws lambda get-function --function-name "${ENV}-servicenow-incident" --region "$REGION" --no-cli-pager
+    check "Log group: /aws/lambda/${ENV}-servicenow-incident" aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/${ENV}-servicenow-incident" --region "$REGION" --query 'logGroups[0].logGroupName' --output text --no-cli-pager
+    check "Webhook Lambda omitted" lambda_absent "${ENV}-devops-agent-webhook"
   else
-    warn "${Y}${PASS}/${TOTAL} resources verified${N}"
+    check "Lambda: ${ENV}-devops-agent-webhook" aws lambda get-function --function-name "${ENV}-devops-agent-webhook" --region "$REGION" --no-cli-pager
+    check "Log group: /aws/lambda/${ENV}-devops-agent-webhook" aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/${ENV}-devops-agent-webhook" --region "$REGION" --query 'logGroups[0].logGroupName' --output text --no-cli-pager
+    check "Secret: ${ENV}-devops-agent-webhook" aws secretsmanager describe-secret --secret-id "${ENV}-devops-agent-webhook" --region "$REGION" --no-cli-pager
+    check "ServiceNow Lambda omitted" lambda_absent "${ENV}-servicenow-incident"
   fi
-  echo ""
-}
+  check "EventBridge: ${ENV}-simple-lambda-schedule" aws events describe-rule --name "${ENV}-simple-lambda-schedule" --region "$REGION" --no-cli-pager
+  check "Alarm: ${ENV}-DynamoDB-WriteThrottle" aws cloudwatch describe-alarms --alarm-names "${ENV}-DynamoDB-WriteThrottle" --region "$REGION" --query 'MetricAlarms[0].AlarmName' --output text --no-cli-pager
+  check "Alarm: ${ENV}-Lambda-Errors" aws cloudwatch describe-alarms --alarm-names "${ENV}-Lambda-Errors" --region "$REGION" --query 'MetricAlarms[0].AlarmName' --output text --no-cli-pager
 
-# ── DYNAMODB WAIT HELPERS ──
-wait_for_dynamodb_table_active() {
-  local table_name="${1:-${ENV}-stress-test-table}"
-  aws dynamodb wait table-active --table-name "$table_name" --region "$REGION" >/dev/null
-}
-
-assert_dynamodb_billing_mode() {
-  local table_name="${1:-${ENV}-stress-test-table}"
-  local expected_mode="$2"
-  local actual_mode
-  actual_mode=$(aws dynamodb describe-table \
-    --table-name "$table_name" \
-    --region "$REGION" \
-    --query 'Table.BillingModeSummary.BillingMode' \
-    --output text 2>/dev/null || echo "UNKNOWN")
-
-  if [[ "$actual_mode" != "$expected_mode" ]]; then
-    fail "DynamoDB billing mode still shows '$actual_mode' for $table_name; expected '$expected_mode'"
-  fi
-}
-
-update_dynamodb_billing_mode() {
-  local table_name="${1:-${ENV}-stress-test-table}"
-  local billing_mode="$2"
-
-  if [[ "$billing_mode" == "PROVISIONED" ]]; then
-    aws dynamodb update-table \
-      --table-name "$table_name" \
-      --billing-mode PROVISIONED \
-      --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=2 \
-      --region "$REGION"
+  local topic_arn="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${ENV}-devops-agent-alarms"
+  local endpoints
+  endpoints="$(aws sns list-subscriptions-by-topic \
+    --topic-arn "$topic_arn" \
+    --region "$REGION" --query 'Subscriptions[].Endpoint' --output text --no-cli-pager 2>/dev/null || true)"
+  sub_count="$(aws sns list-subscriptions-by-topic \
+    --topic-arn "$topic_arn" \
+    --region "$REGION" --query 'length(Subscriptions)' --output text --no-cli-pager 2>/dev/null || echo 0)"
+  check "SNS subscriptions: $sub_count" test "$sub_count" -gt 0
+  if servicenow_incidents_enabled; then
+    check "Alarm topic → ServiceNow Lambda" grep -q "function:${ENV}-servicenow-incident" <<<"$endpoints"
   else
-    aws dynamodb update-table \
-      --table-name "$table_name" \
-      --billing-mode PAY_PER_REQUEST \
-      --region "$REGION"
+    check "Alarm topic → webhook Lambda" grep -q "function:${ENV}-devops-agent-webhook" <<<"$endpoints"
   fi
+
+  echo
+  if (( passed == total )); then ok "All $passed/$total resources verified"
+  else warn "$passed/$total resources verified"; fi
 }
 
-# ── TRIGGER ──
+# Return: TableStatus, BillingMode, MaxWriteRequestUnits.
+get_dynamodb_state() {
+  local table_name="$1"
+  aws dynamodb describe-table --table-name "$table_name" --region "$REGION" \
+    --query 'Table.[TableStatus,BillingModeSummary.BillingMode,OnDemandThroughput.MaxWriteRequestUnits]' \
+    --output text --no-cli-pager
+}
+
+wait_for_dynamodb_throughput_update() {
+  local table_name="$1" expected_limit="$2"
+  local max_attempts="${3:-36}" sleep_seconds="${4:-5}"
+  local attempt=1 status="UNKNOWN" billing_mode="UNKNOWN" current_limit="UNKNOWN"
+
+  while (( attempt <= max_attempts )); do
+    if read -r status billing_mode current_limit < <(get_dynamodb_state "$table_name" 2>/dev/null); then
+      :
+    else
+      status="UNKNOWN"; billing_mode="UNKNOWN"; current_limit="UNKNOWN"
+    fi
+
+    if [[ "$expected_limit" == "-1" ]]; then
+      if [[ "$status" == "ACTIVE" && "$billing_mode" == "PAY_PER_REQUEST" && \
+            ( "$current_limit" == "None" || "$current_limit" == "null" || \
+              "$current_limit" == "-1" || -z "$current_limit" ) ]]; then
+        printf '\r%*s\r' 120 ''
+        ok "DynamoDB write limit removed"
+        return 0
+      fi
+    elif [[ "$status" == "ACTIVE" && "$billing_mode" == "PAY_PER_REQUEST" && \
+            "$current_limit" == "$expected_limit" ]]; then
+      printf '\r%*s\r' 120 ''
+      ok "DynamoDB write limit confirmed: $current_limit"
+      return 0
+    fi
+
+    printf "\r  ${C}⠿${N} status=%s mode=%s write-limit=%s attempt=%s/%s" \
+      "$status" "$billing_mode" "$current_limit" "$attempt" "$max_attempts"
+    sleep "$sleep_seconds"
+    attempt=$((attempt + 1))
+  done
+
+  printf '\r%*s\r' 120 ''
+  echo -e "  ${R}✘${N} DynamoDB update did not reach expected state"
+  echo -e "  ${D}Table:${N} $table_name"
+  echo -e "  ${D}Status:${N} $status"
+  echo -e "  ${D}Billing mode:${N} $billing_mode"
+  echo -e "  ${D}Current write limit:${N} $current_limit"
+  echo -e "  ${D}Expected write limit:${N} $expected_limit"
+  return 1
+}
+
+update_dynamodb_on_demand_limit() {
+  local table_name="$1" max_write_units="$2"
+
+  aws dynamodb update-table --table-name "$table_name" \
+    --on-demand-throughput "MaxWriteRequestUnits=$max_write_units" \
+    --region "$REGION" --no-cli-pager --output json \
+    --query 'TableDescription.[TableName,TableStatus,OnDemandThroughput.MaxWriteRequestUnits]' \
+    >/dev/null || return 1
+
+  ok "DynamoDB update request accepted"
+  wait_for_dynamodb_throughput_update "$table_name" "$max_write_units"
+}
+
 trigger() {
   init
   header "Trigger Incident"
+  local table_name="${ENV}-stress-test-table"
 
-  step "Injecting fault: switching DynamoDB to provisioned (2 WCU)..."
-  update_dynamodb_billing_mode "${ENV}-stress-test-table" "PROVISIONED" || fail "Failed to switch table to PROVISIONED mode"
+  step "Limiting on-demand DynamoDB writes to 2 request units"
+  update_dynamodb_on_demand_limit "$table_name" 2 || fail "Failed to set DynamoDB write limit"
 
-  step "Waiting for DynamoDB table to finish the billing-mode update..."
-  wait_for_dynamodb_table_active "${ENV}-stress-test-table"
-  assert_dynamodb_billing_mode "${ENV}-stress-test-table" "PROVISIONED"
-  ok "Table now at 2 WCU — throttling will start on next Lambda invocation"
+  step "Invoking Lambda to generate write throttling"
+  if aws lambda invoke --function-name "${ENV}-simple-lambda" --region "$REGION" \
+      --cli-connect-timeout 10 --cli-read-timeout 60 --no-cli-pager \
+      /tmp/simple-lambda-response.json >/tmp/simple-lambda-invoke.json; then
+    ok "Lambda invocation completed"
+  else
+    fail "Lambda invocation failed"
+  fi
 
-  step "Invoking Lambda immediately to start throttling..."
-  aws lambda invoke --function-name "${ENV}-simple-lambda" --region "$REGION" /dev/null &>/dev/null &
-  ok "Lambda invoked — alarm should fire within ~1 minute"
   echo -e "  ${D}Alarm:${N} ${ENV}-DynamoDB-WriteThrottle"
-  echo ""
-  echo -e "  ${B}Next step — once investigation completes, restore normal operation:${N}"
-  echo -e "  ${D}    ./doa.sh restore${N}"
-  echo ""
+  echo -e "  ${D}Restore:${N} ./doa.sh restore"
 }
 
-# ── RESTORE ──
 restore() {
   init
   header "Restore"
+  local table_name="${ENV}-stress-test-table"
 
-  step "Restoring DynamoDB to on-demand..."
-  update_dynamodb_billing_mode "${ENV}-stress-test-table" "PAY_PER_REQUEST" || fail "Failed to switch table back to PAY_PER_REQUEST mode"
-
-  step "Waiting for DynamoDB table to finish the update before exiting..."
-  wait_for_dynamodb_table_active "${ENV}-stress-test-table"
-  assert_dynamodb_billing_mode "${ENV}-stress-test-table" "PAY_PER_REQUEST"
-  ok "Table restored to on-demand — throttling will stop"
-  echo ""
-  echo -e "  ${B}Next step — clean up all resources when done:${N}"
-  echo -e "  ${D}    ./doa.sh cleanup${N}"
-  echo ""
+  step "Removing the on-demand DynamoDB write limit"
+  update_dynamodb_on_demand_limit "$table_name" -1 || fail "Failed to remove DynamoDB write limit"
+  ok "DynamoDB remains PAY_PER_REQUEST with no explicit write limit"
 }
 
-# ── ALARMS ──
 alarms() {
   init
   header "Alarm Status"
-
   aws cloudwatch describe-alarms \
     --alarm-names "${ENV}-DynamoDB-WriteThrottle" "${ENV}-Lambda-Errors" \
-    --query "MetricAlarms[].[AlarmName,StateValue,StateUpdatedTimestamp]" \
-    --output table --region "$REGION"
+    --query 'MetricAlarms[].[AlarmName,StateValue,StateUpdatedTimestamp]' \
+    --output table --region "$REGION" --no-cli-pager
 }
 
-# ── CLEANUP ──
 cleanup() {
   init
   header "Cleanup"
+  local config_bucket="${ENV}-simple-lambda-config-${ACCOUNT_ID}"
+  local agent_stack="CTDevOpsAgentStack"
+  local confirm
 
-  CONFIG_BUCKET="${ENV}-simple-lambda-config-${ACCOUNT_ID}"
-  STACK_NAME_AGENT=$(aws cloudformation list-stacks \
-    --stack-status-filter CREATE_IN_PROGRESS CREATE_FAILED CREATE_COMPLETE ROLLBACK_IN_PROGRESS ROLLBACK_FAILED ROLLBACK_COMPLETE DELETE_FAILED UPDATE_IN_PROGRESS UPDATE_COMPLETE UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_FAILED UPDATE_ROLLBACK_IN_PROGRESS UPDATE_ROLLBACK_FAILED UPDATE_ROLLBACK_COMPLETE UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS IMPORT_IN_PROGRESS IMPORT_COMPLETE IMPORT_ROLLBACK_IN_PROGRESS IMPORT_ROLLBACK_FAILED IMPORT_ROLLBACK_COMPLETE \
-    --query "StackSummaries[?StackName=='CTDevOpsAgentStack'] | [0].StackName" \
-    --output text --region "$REGION" 2>/dev/null || echo "none")
-  # Show cleanup summary
-  echo -e "  ${R}${B}⚠ This will permanently delete:${N}"
-  echo -e "  ${D}├─${N} Account:  $ACCOUNT_ID"
-  echo -e "  ${D}├─${N} Region:   $REGION"
-  echo -e "  ${D}├─${N} InfraStack:    $STACK_NAME"
-  echo -e "  ${D}├─${N} AgentStack:    $STACK_NAME_AGENT"
-  echo -e "  ${D}├─${N} Bucket:   $CONFIG_BUCKET"
-  echo -e "  ${D}├─${N} Bucket:   $BUCKET"
-  echo -e "  ${D}└─${N} Logs:     /aws/lambda/${ENV}-simple-lambda, /aws/lambda/${ENV}-devops-agent-webhook"
-  echo
+  echo -e "  ${R}${B}This deletes:${N} $STACK_NAME, $agent_stack, $config_bucket and $BUCKET"
   read -rp "  Proceed with cleanup? [y/N] " confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || { echo -e "  ${D}Aborted.${N}"; exit 0; }
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
 
-  step "Disabling EventBridge schedule..."
-  aws events disable-rule --name "${ENV}-simple-lambda-schedule" --region "$REGION" 2>/dev/null || true
-  ok "Schedule disabled"
+  aws events disable-rule --name "${ENV}-simple-lambda-schedule" --region "$REGION" --no-cli-pager 2>/dev/null || true
 
-  step "Emptying config bucket: $CONFIG_BUCKET"
-  if aws s3api head-bucket --bucket "$CONFIG_BUCKET" --region "$REGION" 2>/dev/null; then
-    aws s3 rm "s3://$CONFIG_BUCKET" --recursive --quiet --region "$REGION" 2>/dev/null || true
-    # Purge delete markers and old versions left from when versioning was enabled
-    VERSIONS=$(aws s3api list-object-versions --bucket "$CONFIG_BUCKET" --region "$REGION" --output json 2>/dev/null || echo '{}')
-    DELETE_PAYLOAD=$(echo "$VERSIONS" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-objects = [{'Key': o['Key'], 'VersionId': o['VersionId']}
-           for o in data.get('Versions', []) + data.get('DeleteMarkers', [])]
-if objects:
-    print(json.dumps({'Objects': objects, 'Quiet': True}))
-" 2>/dev/null || true)
-    if [[ -n "$DELETE_PAYLOAD" ]]; then
-      aws s3api delete-objects --bucket "$CONFIG_BUCKET" --region "$REGION" --delete "$DELETE_PAYLOAD" 2>/dev/null || true
+  for bucket in "$config_bucket" "$BUCKET"; do
+    if aws s3api head-bucket --bucket "$bucket" --region "$REGION" >/dev/null 2>&1; then
+      aws s3 rm "s3://$bucket" --recursive --quiet --region "$REGION" || true
+      aws s3 rb "s3://$bucket" --force --region "$REGION" >/dev/null 2>&1 || true
     fi
-  fi
-  ok "Bucket emptied"
-
-  step "Deleting stack: $STACK_NAME"
-  aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
-  if spin "Waiting for stack deletion..." \
-    aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$REGION"; then
-    ok "Stack deleted"
-  else
-    warn "Stack deletion may still be in progress"
-  fi
-
-  step "Cleaning up orphaned log groups..."
-  for lg in "/aws/lambda/${ENV}-simple-lambda" "/aws/lambda/${ENV}-devops-agent-webhook"; do
-    aws logs delete-log-group --log-group-name "$lg" --region "$REGION" 2>/dev/null && \
-      ok "Deleted $lg" || true
   done
 
-  step "Removing S3 bucket: $BUCKET"
-  aws s3 rb "s3://$BUCKET" --force --region "$REGION" 2>/dev/null && \
-    ok "Bucket removed" || warn "Bucket may not exist"
-
-  if [[ "$STACK_NAME_AGENT" != "none" && "$STACK_NAME_AGENT" != "None" ]]; then
-    step "Deleting stack: $STACK_NAME_AGENT"
-    aws cloudformation delete-stack --stack-name "$STACK_NAME_AGENT" --region "$REGION"
-    if spin "Waiting for stack deletion..." \
-      aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME_AGENT" --region "$REGION"; then
-      ok "Stack deleted"
-    else
-      warn "Stack deletion may still be in progress"
-    fi
-  else
-    warn "Agent stack not found"
+  if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION" --no-cli-pager
+    spin "Deleting infrastructure stack..." aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$REGION" --no-cli-pager || \
+      warn "Infrastructure stack deletion did not complete cleanly"
   fi
 
-  ok "Cleanup complete"
-  echo ""
-  echo -e "  ${B}All resources removed. To redeploy:${N}"
-  echo -e "  ${D}    ./doa.sh deploy${N}"
-  echo ""
+  if aws cloudformation describe-stacks --stack-name "$agent_stack" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "$agent_stack" --region "$REGION" --no-cli-pager
+    spin "Deleting agent stack..." aws cloudformation wait stack-delete-complete --stack-name "$agent_stack" --region "$REGION" --no-cli-pager || \
+      warn "Agent stack deletion did not complete cleanly"
+  fi
+
+  ok "Cleanup completed"
 }
 
-# ── USAGE ──
-usage() {
-  echo -e "\n  ${B}AWS DevOps Agent Demo${N} — Automated Incident Lifecycle\n"
-  echo -e "  ${B}Usage:${N} $0 <command>\n"
-  echo -e "  ${B}Setup:${N}"
-  echo -e "    cp .env.example .env    ${D}# configure account, region, webhook creds${N}\n"
-  echo -e "  ${B}Commands:${N}"
-  echo -e "    ${C}pre${N}                Check prerequisites (CLI tools, credentials, agent space)"
-  echo -e "    ${C}agent-stack${N}        Provision the AWS DevOps Agent CloudFormation stack first"
-  echo -e "    ${C}deploy${N}             Deploy infrastructure (DynamoDB, Lambda, SNS, Alarms)"
-  echo -e "    ${C}verify${N}             Verify all resources exist and are healthy"
-  echo -e "    ${C}trigger${N}            Inject fault — switch DynamoDB to 2 WCU provisioned"
-  echo -e "    ${C}alarms${N}             Check CloudWatch alarm states"
-  echo -e "    ${C}restore${N}            Undo fault — restore DynamoDB to on-demand"
-  echo -e "    ${C}track${N}              Watch CloudFormation stack events"
-  echo -e "    ${C}cleanup${N}            Tear down all resources (with confirmation)\n"
-  echo -e "  ${B}Quick start:${N}"
-  echo -e "    ${D}1.${N} cp .env.example .env       ${D}# configure base env${N}"
-  echo -e "    ${D}2.${N} $0 pre                     ${D}# check tools & creds${N}"
-  echo -e "    ${D}3.${N} $0 agent-stack             ${D}# provision the AWS DevOps Agent stack first${N}"
-  echo -e "    ${D}4.${N} Edit .env and set WEBHOOK_URL + WEBHOOK_SECRET${D}# then deploy the demo stack${N}"
-  echo -e "    ${D}5.${N} $0 deploy                  ${D}# deploy infra${N}"
-  echo -e "    ${D}6.${N} source .env && python3 scripts/agent_monitor.py  ${D}# terminal 2${N}"
-  echo -e "    ${D}7.${N} $0 trigger                 ${D}# inject incident${N}"
-  echo -e "    ${D}8.${N} $0 restore                 ${D}# undo fault${N}"
-  echo -e "    ${D}9.${N} $0 cleanup                 ${D}# tear down${N}\n"
-}
-
-# ── MAIN ──
-if [[ $# -eq 0 ]]; then
-  usage; exit 0
-fi
-
-CMD="$1"
-
-case "$CMD" in
-  pre)     pre ;;
-  help|-h) usage ;;
+case "$1" in
+  pre) pre ;;
+  help|-h|--help) usage ;;
   agent-stack|provision-agent-stack)
     require_env agent-stack
-    provision_agent_stack ;;
+    provision_agent_stack
+    ;;
   deploy|trigger|restore|track|verify|cleanup|alarms)
     require_env
-    STACK_NAME="${ENV}-devops-agent-demo"
-    $CMD ;;
-  *)       echo -e "  ${R}Unknown command: $CMD${N}"; usage; exit 1 ;;
+    "$1"
+    ;;
+  *)
+    echo -e "  ${R}Unknown command:${N} $1"
+    usage
+    exit 1
+    ;;
 esac

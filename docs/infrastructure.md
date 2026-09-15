@@ -72,7 +72,7 @@ graph TD
 
 ## Fault Injection
 
-The `simulate_incident.py` script switches DynamoDB from on-demand to provisioned with 2 WCU:
+The incident trigger keeps DynamoDB on-demand billing and caps the table at 2 write request units:
 
 ```mermaid
 sequenceDiagram
@@ -84,8 +84,8 @@ sequenceDiagram
 
     rect rgb(240, 248, 255)
     Note over DDB: On-demand (~400 WRU)
-    Op->>DDB: update_table(WCU=2)
-    Note over DDB: Provisioned (2 WCU)
+    Op->>DDB: update_table(MaxWriteRequestUnits=2)
+    Note over DDB: On-demand (2 max WRU)
     end
 
     rect rgb(255, 240, 240)
@@ -99,12 +99,12 @@ sequenceDiagram
     end
 
     rect rgb(240, 255, 240)
-    DA->>DA: RCA billing mode changed
-    DA->>DA: Mitigation restore on-demand
+    DA->>DA: RCA on-demand write limit applied
+    DA->>DA: Mitigation remove write limit
     end
 
     rect rgb(240, 248, 255)
-    Op->>DDB: restore on-demand
+    Op->>DDB: remove write limit
     Note over DDB: On-demand (restored)
     end
 ```

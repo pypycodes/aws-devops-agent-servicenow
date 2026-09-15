@@ -23,7 +23,7 @@ Estimated costs for the demo environment running in us-east-1.
 
 | Resource | Additional Cost |
 |----------|----------------|
-| DynamoDB (2 WCU provisioned) | ~$0.00 (lower than on-demand) |
+| DynamoDB (on-demand, 2-unit cap) | ~$0.00 |
 | Lambda errors/retries | Negligible |
 | AWS DevOps Agent investigation | ~$3.98 per investigation (8 min avg) |
 | **Additional demo cost** | **~$0.00** |

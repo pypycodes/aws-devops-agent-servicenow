@@ -49,9 +49,9 @@ aws cloudwatch describe-alarms \
 
 ### Step 2: Inject the Fault (~1 min)
 
-> **What's happening:** This switches the DynamoDB table from on-demand (~400 WCU)
-> to provisioned with only 2 WCU. The Lambda still fires every minute doing 60s of
-> writes — but now those writes hit a 2 WCU limit, causing `WriteThrottleEvents`.
+> **What's happening:** This keeps the DynamoDB table on on-demand billing but caps it
+> at 2 write request units. The Lambda still fires every minute doing 60s of writes
+> — but now those writes hit the 2-unit limit, causing `WriteThrottleEvents`.
 > Amazon CloudWatch detects the throttling and fires the alarm within ~60 seconds.
 
 **Terminal 2:**
@@ -72,7 +72,7 @@ aws cloudwatch describe-alarms \
 1. **New task detected** — investigation created by the webhook
 2. **IN_PROGRESS** — agent is analyzing metrics, logs, and CloudTrail
 3. **COMPLETED** — agent found the root cause
-4. **Root cause displayed** — e.g., "billing mode changed from on-demand to provisioned with 2 WCU"
+4. **Root cause displayed** — e.g., "on-demand write throughput limited to 2 units"
 5. **Mitigation triggered** — script sends `generate_mitigation_plan` via API
 6. **Mitigation plan** — step-by-step remediation with CLI commands
 
@@ -80,9 +80,9 @@ aws cloudwatch describe-alarms \
 
 ### Step 4: Restore Normal Operation (~30 sec)
 
-> **What's happening:** This switches DynamoDB back to on-demand. The Lambda's
-> writes succeed again, throttle metrics drop to zero, and the alarm returns
-> to OK within ~2 minutes.
+> **What's happening:** This removes the explicit on-demand write limit. The
+> Lambda's writes succeed again, throttle metrics drop to zero, and the alarm
+> returns to OK within ~2 minutes.
 
 **Terminal 2:**
 ```bash
@@ -99,7 +99,7 @@ aws devops-agent create-backlog-task \
   --agent-space-id <space-id> \
   --task-type INVESTIGATION \
   --title "DynamoDB throttling on ${ENV}-stress-test-table" \
-  --description "WriteThrottleEvents alarm firing, table switched to provisioned billing" \
+  --description "WriteThrottleEvents alarm firing, on-demand write throughput capped at 2 units" \
   --priority HIGH \
   --region us-east-1 --output json
 ```
@@ -110,7 +110,7 @@ aws devops-agent create-backlog-task \
 ## Cleanup
 
 ```bash
-# Restore table to on-demand (if not already done)
+# Remove the on-demand write cap (if not already done)
 ./doa.sh restore
 
 # Or tear down everything

@@ -212,19 +212,19 @@ python3 scripts/agent_monitor.py
 
 > For a detailed walkthrough with explanations of what's happening at each stage, see [docs/tutorial-flow.md](docs/tutorial-flow.md).
 
-Trigger the incident by switching DynamoDB from on-demand to provisioned with only 2 write capacity units:
+Trigger the incident by keeping DynamoDB on-demand and capping writes at 2 request units:
 
 ```bash
 ./doa.sh trigger
 ```
 
 **What this does:**
-- Switches the DynamoDB table from on-demand (unlimited) to provisioned mode with 2 WCU
+- Keeps the DynamoDB table on-demand and applies a 2-unit maximum write request limit
 - The Lambda (running every minute with 60s of continuous writes) immediately starts getting throttled
 - `WriteThrottleEvents` metric spikes → CloudWatch Alarm fires → SNS → Webhook → AWS DevOps Agent investigation starts
 
 **What happens next (automated):**
-1. SimpleLambda fires, tries 60s of writes against 2 WCU → throttling
+1. SimpleLambda fires, tries 60s of writes against a 2-unit on-demand write cap → throttling
 2. `DDB Throttle Alarm` enters ALARM state
 3. Alarm → SNS → Webhook Lambda → AWS DevOps Agent starts investigation
 4. Agent monitor detects investigation, shows RCA, triggers mitigation
@@ -238,7 +238,7 @@ The agent monitor displays findings like:
 
 | Finding | Root Cause | Mitigation |
 |---------|-----------|------------|
-| DynamoDB throttling | Table switched to 2 WCU provisioned | Restore on-demand or add auto-scaling |
+| DynamoDB throttling | On-demand write throughput capped at 2 units | Remove the maximum write limit or raise the cap |
 | Lambda errors | No retry/backoff for throttled writes | Add exponential backoff |
 | Cascading failures | 60s write loop with no circuit breaker | Add error threshold + early exit |
 
@@ -253,7 +253,7 @@ Once you've observed the full lifecycle, restore the table:
 ```
 
 **What this does:**
-- Switches DynamoDB back to on-demand billing mode
+- Removes the DynamoDB maximum write limit while keeping on-demand billing mode
 - Throttling stops immediately
 - Alarms return to OK state within 1–2 minutes
 

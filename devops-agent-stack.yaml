@@ -10,6 +10,42 @@ Parameters:
     Type: String
     Default: Agent space deployed with CloudFormation for CT DevOpsAgent Demo
     Description: CT DevOpsAgent Demo
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for DevOps Agent investigation and mitigation notifications
+  EnableServiceNow:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Register and associate a ServiceNow capability
+  ServiceNowInstanceUrl:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://[a-zA-Z0-9-]+\.service-now\.com/?$'
+    Description: ServiceNow instance URL, for example https://example.service-now.com
+  ServiceNowClientId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: ServiceNow OAuth client ID
+  ServiceNowClientName:
+    Type: String
+    Default: AWS DevOps Agent ServiceNow Integration
+    Description: Friendly name for the ServiceNow OAuth client
+  ServiceNowClientSecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: ServiceNow OAuth client secret
+  ServiceNowInstanceId:
+    Type: String
+    Default: ''
+    Description: ServiceNow instance identifier used by the association
+
+Conditions:
+  ServiceNowEnabled: !Equals [!Ref EnableServiceNow, 'true']
+  NotificationEnabled: !Not [!Equals [!Ref NotificationEmail, '']]
 
 Resources:
   # IAM role assumed by the DevOps Agent service to monitor the account
@@ -43,6 +79,27 @@ Resources:
                 Resource:
                   - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer
 
+
+  # IAM role used by Agent Actions after they are enabled in the console
+  DevOpsAgentActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CT-DevOpsAgentRole-AgentActions
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentActionsPolicy
+
   # IAM role for the operator app interface
   DevOpsOperatorRole:
     Type: AWS::IAM::Role
@@ -65,12 +122,35 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AIDevOpsOperatorAppAccessPolicy
 
+  ServiceNow:
+    Type: AWS::DevOpsAgent::Service
+    Condition: ServiceNowEnabled
+    Properties:
+      ServiceType: servicenow
+      ServiceDetails:
+        ServiceNow:
+          InstanceUrl: !Ref ServiceNowInstanceUrl
+          AuthorizationConfig:
+            OAuthClientCredentials:
+              ClientName: !Ref ServiceNowClientName
+              ClientId: !Ref ServiceNowClientId
+              ClientSecret: !Ref ServiceNowClientSecret
+
+  ServiceNowAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Condition: ServiceNowEnabled
+    Properties:
+      AgentSpaceId: !GetAtt AgentSpace.AgentSpaceId
+      ServiceId: !GetAtt ServiceNow.ServiceId
+      Configuration:
+        ServiceNow:
+          InstanceId: !Ref ServiceNowInstanceId
+
   # The agent space resource
   AgentSpace:
     Type: AWS::DevOpsAgent::AgentSpace
     DependsOn:
       - DevOpsAgentSpaceRole
-      - DevOpsOperatorRole
     Properties:
       Name: !Ref AgentSpaceName
       Description: !Ref AgentSpaceDescription
@@ -90,6 +170,80 @@ Resources:
           AccountId: !Ref AWS::AccountId
           AccountType: monitor
 
+  DevOpsAgentNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: NotificationEnabled
+    Properties:
+      TopicName: !Sub '${AgentSpaceName}-notifications'
+      DisplayName: DevOps Agent Notifications
+      KmsMasterKeyId: alias/aws/sns
+
+  DevOpsAgentNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: NotificationEnabled
+    Properties:
+      TopicArn: !Ref DevOpsAgentNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  DevOpsAgentNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: NotificationEnabled
+    Properties:
+      Topics:
+        - !Ref DevOpsAgentNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref DevOpsAgentNotificationTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt DevOpsAgentNotificationRule.Arn
+
+  DevOpsAgentNotificationRule:
+    Type: AWS::Events::Rule
+    Condition: NotificationEnabled
+    Properties:
+      Name: !Sub '${AgentSpaceName}-investigation-mitigation-events'
+      Description: Notify on AWS DevOps Agent investigation and mitigation lifecycle events
+      EventPattern:
+        source:
+          - aws.aidevops
+        detail-type:
+          - Investigation Completed
+          - Investigation Failed
+          - Investigation Timed Out
+          - Mitigation Completed
+          - Mitigation Failed
+          - Mitigation Timed Out
+        detail:
+          metadata:
+            agent_space_id:
+              - !GetAtt AgentSpace.AgentSpaceId
+      State: ENABLED
+      Targets:
+        - Id: DevOpsAgentSnsTarget
+          Arn: !Ref DevOpsAgentNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              detailType: '$.detail-type'
+              status: '$.detail.data.status'
+              priority: '$.detail.data.priority'
+              taskId: '$.detail.metadata.task_id'
+              agentSpaceId: '$.detail.metadata.agent_space_id'
+              summaryId: '$.detail.data.summary_record_id'
+              updatedAt: '$.detail.data.updated_at'
+              alarmArn: '$.detail.data.alarm_arn'
+              incidentId: '$.detail.data.incident_id'
+              correlationId: '$.detail.data.correlation_id'
+              rawDetail: '$.detail'
+            InputTemplate: >-
+              {"eventType":"<detailType>","status":"<status>","priority":"<priority>","agentSpaceId":"<agentSpaceId>","taskId":"<taskId>","summaryId":"<summaryId>","updatedAt":"<updatedAt>","alarmArn":"<alarmArn>","incidentId":"<incidentId>","correlationId":"<correlationId>","detail":<rawDetail>}
 Outputs:
   AgentSpaceId:
     Description: The agent space ID
@@ -103,3 +257,14 @@ Outputs:
   OperatorRoleArn:
     Description: The operator app IAM role ARN
     Value: !GetAtt DevOpsOperatorRole.Arn
+  AgentActionsRoleArn:
+    Description: Attach this role when enabling Agent Actions in the console
+    Value: !GetAtt DevOpsAgentActionsRole.Arn
+  ServiceNowServiceId:
+    Condition: ServiceNowEnabled
+    Description: The registered ServiceNow service ID
+    Value: !GetAtt ServiceNow.ServiceId
+  DevOpsAgentNotificationTopicArn:
+    Condition: NotificationEnabled
+    Description: SNS topic ARN for DevOps Agent notifications
+    Value: !Ref DevOpsAgentNotificationTopic

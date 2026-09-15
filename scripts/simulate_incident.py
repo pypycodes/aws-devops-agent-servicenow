@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Trigger incident by switching DynamoDB from on-demand to provisioned (2 WCU).
-The SimpleLambda keeps writing every minute — throttling starts immediately.
+Trigger incident by keeping DynamoDB on-demand and capping writes at 2 request units.
+The SimpleLambda keeps writing every minute, so throttling starts immediately.
 
 Usage: python3 simulate_incident.py [env]
-       python3 simulate_incident.py demo restore   # restore on-demand
+    python3 simulate_incident.py demo restore   # remove the on-demand write cap
 """
 
 import boto3
@@ -29,30 +29,32 @@ cw = boto3.client("cloudwatch", region_name=REGION)
 
 
 def inject():
-    print(f"🔥 Injecting fault: switching {TABLE} to provisioned (2 WCU)")
+    print(f"Injecting fault: limiting {TABLE} to 2 on-demand write request units")
     try:
         ddb.update_table(
             TableName=TABLE,
-            BillingMode="PROVISIONED",
-            ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 2},
+            OnDemandThroughput={"MaxWriteRequestUnits": 2},
         )
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
         sys.exit(1)
-    print(f"✅ Table now at 2 WCU — SimpleLambda runs every minute doing 60s of writes")
+    print(f"Table now has a 2-unit on-demand write cap. SimpleLambda runs every minute doing 60s of writes")
     print(f"   Throttling will start on next Lambda invocation")
     print(f"   Alarm: {ALARM}")
     print(f"\n   Restore: python3 {sys.argv[0]} {ENV} restore")
 
 
 def restore():
-    print(f"🔧 Restoring {TABLE} to on-demand")
+    print(f"Removing the on-demand write cap from {TABLE}")
     try:
-        ddb.update_table(TableName=TABLE, BillingMode="PAY_PER_REQUEST")
+        ddb.update_table(
+            TableName=TABLE,
+            OnDemandThroughput={"MaxWriteRequestUnits": -1},
+        )
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
         sys.exit(1)
-    print(f"✅ Table restored to on-demand — throttling will stop")
+    print(f"DynamoDB remains on-demand with no explicit write cap. Throttling will stop")
 
 
 if CMD == "restore":
