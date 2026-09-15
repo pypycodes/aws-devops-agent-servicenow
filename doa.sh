@@ -29,6 +29,10 @@ usage() {
     agent-stack  Provision the AWS DevOps Agent stack
     deploy       Deploy the demo infrastructure only
     verify       Verify resources
+    servicenow-test     Test ServiceNow OAuth authentication
+    servicenow-list     List ServiceNow webhook sys_properties
+    servicenow-webhook  Update ServiceNow webhook URL and HMAC secret
+    servicenow-verify   Show ServiceNow webhook properties with secret redacted
     trigger      Set DynamoDB max writes to 2 and invoke Lambda
     alarms       Show CloudWatch alarm states
     restore      Remove the DynamoDB maximum write limit
@@ -60,6 +64,8 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=""
 BUCKET=""
 STACK_NAME=""
+SERVICENOW_WEBHOOK_URL_PROPERTY="aws.devopsagent.webhook.url"
+SERVICENOW_WEBHOOK_SECRET_PROPERTY="aws.devopsagent.webhook.secret"
 
 servicenow_incidents_enabled() {
   [[ "${ENABLE_SERVICENOW:-false}" == "true" ]]
@@ -99,14 +105,140 @@ validate_servicenow_config() {
   local enabled="${1:-${ENABLE_SERVICENOW:-false}}"
   [[ "$enabled" == "true" ]] || return 0
 
+  validate_servicenow_oauth_config
+  [[ -n "${SERVICENOW_INSTANCE_ID:-}" ]] || fail "SERVICENOW_INSTANCE_ID is required"
+
+  echo -e "  ${D}ServiceNow:${N} enabled (${SERVICENOW_INSTANCE_URL})"
+}
+
+validate_servicenow_oauth_config() {
   [[ -n "${SERVICENOW_INSTANCE_URL:-}" ]] || fail "SERVICENOW_INSTANCE_URL is required"
   [[ "$SERVICENOW_INSTANCE_URL" =~ ^https://[^/]+\.service-now\.com/?$ ]] || \
     fail "SERVICENOW_INSTANCE_URL must match https://<instance>.service-now.com"
   [[ -n "${SERVICENOW_CLIENT_ID:-}" ]] || fail "SERVICENOW_CLIENT_ID is required"
   [[ -n "${SERVICENOW_CLIENT_SECRET:-}" ]] || fail "SERVICENOW_CLIENT_SECRET is required"
-  [[ -n "${SERVICENOW_INSTANCE_ID:-}" ]] || fail "SERVICENOW_INSTANCE_ID is required"
+}
 
-  echo -e "  ${D}ServiceNow:${N} enabled (${SERVICENOW_INSTANCE_URL})"
+require_servicenow_webhook_config() {
+  servicenow_incidents_enabled || fail "ENABLE_SERVICENOW must be true to update ServiceNow webhook properties"
+  validate_servicenow_oauth_config
+  validate_webhook_config
+  command -v curl >/dev/null 2>&1 || fail "curl is required"
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
+}
+
+servicenow_base_url() {
+  printf '%s' "${SERVICENOW_INSTANCE_URL%/}"
+}
+
+servicenow_access_token() {
+  local token_response access_token
+
+  token_response="$(curl --fail-with-body -sS -X POST \
+    "$(servicenow_base_url)/oauth_token.do" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "grant_type=client_credentials" \
+    --data-urlencode "client_id=${SERVICENOW_CLIENT_ID}" \
+    --data-urlencode "client_secret=${SERVICENOW_CLIENT_SECRET}")" || \
+    fail "Failed to call ServiceNow OAuth endpoint"
+
+  access_token="$(jq -r '.access_token // empty' <<<"$token_response")"
+  [[ -n "$access_token" ]] || fail "ServiceNow OAuth response did not include access_token"
+  printf '%s' "$access_token"
+}
+
+servicenow_property_sysid() {
+  local access_token="$1" property_name="$2"
+
+  curl --fail-with-body -sS --get \
+    -H "Authorization: Bearer ${access_token}" \
+    -H "Accept: application/json" \
+    --data-urlencode "sysparm_query=name=${property_name}" \
+    --data-urlencode "sysparm_fields=sys_id,name" \
+    --data-urlencode "sysparm_limit=1" \
+    "$(servicenow_base_url)/api/now/table/sys_properties" | \
+    jq -r '.result[0].sys_id // empty'
+}
+
+servicenow_update_property() {
+  local access_token="$1" property_name="$2" property_value="$3"
+  local sys_id response
+
+  sys_id="$(servicenow_property_sysid "$access_token" "$property_name")"
+  [[ -n "$sys_id" ]] || fail "ServiceNow property not found: $property_name"
+
+  response="$(curl --fail-with-body -sS -X PATCH \
+    -H "Authorization: Bearer ${access_token}" \
+    -H "Accept: application/json" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg value "$property_value" '{value:$value}')" \
+    "$(servicenow_base_url)/api/now/table/sys_properties/${sys_id}")" || \
+    fail "Failed to update ServiceNow property: $property_name"
+
+  jq -er '.result.sys_id' <<<"$response" >/dev/null || fail "Unexpected update response for $property_name"
+  ok "Updated $property_name"
+}
+
+servicenow_test() {
+  validate_servicenow_oauth_config
+  command -v curl >/dev/null 2>&1 || fail "curl is required"
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
+
+  servicenow_access_token >/dev/null
+  ok "ServiceNow OAuth authentication successful"
+  echo -e "  ${D}Instance:${N} $(servicenow_base_url)"
+}
+
+servicenow_list() {
+  local access_token
+  validate_servicenow_oauth_config
+  command -v curl >/dev/null 2>&1 || fail "curl is required"
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
+  access_token="$(servicenow_access_token)"
+
+  curl --fail-with-body -sS --get \
+    -H "Authorization: Bearer ${access_token}" \
+    -H "Accept: application/json" \
+    --data-urlencode "sysparm_query=nameSTARTSWITHaws.devopsagent.webhook" \
+    --data-urlencode "sysparm_fields=name,sys_id" \
+    "$(servicenow_base_url)/api/now/table/sys_properties" | \
+    jq -r '.result[] | "\(.name)  \(.sys_id)"'
+}
+
+servicenow_webhook() {
+  header "Update ServiceNow Webhook"
+  servicenow_update_webhook_properties
+}
+
+servicenow_update_webhook_properties() {
+  local access_token secret_fingerprint
+  require_servicenow_webhook_config
+  access_token="$(servicenow_access_token)"
+
+  step "Updating ServiceNow webhook properties"
+  servicenow_update_property "$access_token" "$SERVICENOW_WEBHOOK_URL_PROPERTY" "$WEBHOOK_URL"
+  servicenow_update_property "$access_token" "$SERVICENOW_WEBHOOK_SECRET_PROPERTY" "$WEBHOOK_SECRET"
+
+  secret_fingerprint="$(printf '%s' "$WEBHOOK_SECRET" | sha256sum | awk '{print substr($1,1,12)}')"
+  ok "Webhook URL updated"
+  ok "Webhook HMAC secret updated, fingerprint: $secret_fingerprint"
+}
+
+servicenow_verify() {
+  local access_token
+  validate_servicenow_oauth_config
+  command -v curl >/dev/null 2>&1 || fail "curl is required"
+  command -v jq >/dev/null 2>&1 || fail "jq is required"
+  access_token="$(servicenow_access_token)"
+
+  curl --fail-with-body -sS --get \
+    -H "Authorization: Bearer ${access_token}" \
+    -H "Accept: application/json" \
+    --data-urlencode "sysparm_query=nameIN${SERVICENOW_WEBHOOK_URL_PROPERTY},${SERVICENOW_WEBHOOK_SECRET_PROPERTY}" \
+    --data-urlencode "sysparm_fields=name,value" \
+    "$(servicenow_base_url)/api/now/table/sys_properties" | \
+    jq --arg secret_name "$SERVICENOW_WEBHOOK_SECRET_PROPERTY" \
+      '.result[] | if .name == $secret_name then .value = "<redacted>" else . end'
 }
 
 init() {
@@ -157,7 +289,7 @@ pre() {
   header "Prerequisites"
   local passed=0 total=0 tool
 
-  for tool in aws python3 zip jq; do
+  for tool in aws python3 zip jq curl; do
     total=$((total + 1))
     if command -v "$tool" >/dev/null 2>&1; then
       ok "$tool: $(command -v "$tool")"
@@ -245,9 +377,15 @@ deploy() {
   init
   header "Deploy Infrastructure"
 
-  local confirm agent_topic_arn
+  local confirm agent_topic_arn package_dir
   read -rp "  Deploy $STACK_NAME in account $ACCOUNT_ID? [y/N] " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
+
+  if servicenow_incidents_enabled; then
+    servicenow_update_webhook_properties
+  fi
+
+  package_dir="$(mktemp -d)"
 
   step "Creating code bucket: $BUCKET"
   if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1; then
@@ -263,18 +401,19 @@ deploy() {
   fi
 
   step "Packaging and uploading Lambda functions"
-  (cd "$SCRIPT_DIR/lambdas/app" && zip -q -j /tmp/simple-lambda.zip simple_lambda.py)
-  aws s3 cp /tmp/simple-lambda.zip "s3://$BUCKET/simple-lambda.zip" --region "$REGION" --quiet
+  (cd "$SCRIPT_DIR/lambdas/app" && zip -q -j "$package_dir/simple-lambda.zip" simple_lambda.py)
+  aws s3 cp "$package_dir/simple-lambda.zip" "s3://$BUCKET/simple-lambda.zip" --region "$REGION" --quiet
   if servicenow_incidents_enabled; then
-    (cd "$SCRIPT_DIR/lambdas/servicenow-incident" && zip -q -j /tmp/servicenow-incident-lambda.zip index.mjs)
-    aws s3 cp /tmp/servicenow-incident-lambda.zip "s3://$BUCKET/servicenow-incident-lambda.zip" --region "$REGION" --quiet
+    (cd "$SCRIPT_DIR/lambdas/servicenow-incident" && zip -q -j "$package_dir/servicenow-incident-lambda.zip" index.mjs)
+    aws s3 cp "$package_dir/servicenow-incident-lambda.zip" "s3://$BUCKET/servicenow-incident-lambda.zip" --region "$REGION" --quiet
     echo -e "  ${D}Alarm trigger:${N} ServiceNow incident Lambda (webhook Lambda omitted)"
   else
-    (cd "$SCRIPT_DIR/lambdas/webhook" && zip -q -j /tmp/webhook-lambda.zip index.mjs)
-    aws s3 cp /tmp/webhook-lambda.zip "s3://$BUCKET/webhook-lambda.zip" --region "$REGION" --quiet
+    (cd "$SCRIPT_DIR/lambdas/webhook" && zip -q -j "$package_dir/webhook-lambda.zip" index.mjs)
+    aws s3 cp "$package_dir/webhook-lambda.zip" "s3://$BUCKET/webhook-lambda.zip" --region "$REGION" --quiet
     echo -e "  ${D}Alarm trigger:${N} webhook Lambda → DevOps Agent (ServiceNow incident Lambda omitted)"
   fi
   ok "Lambda packages uploaded"
+  rm -rf "$package_dir"
 
   agent_topic_arn="$(aws cloudformation describe-stacks \
     --stack-name CTDevOpsAgentStack --region "$REGION" \
@@ -509,6 +648,10 @@ cleanup() {
 case "$1" in
   pre) pre ;;
   help|-h|--help) usage ;;
+  servicenow-test) servicenow_test ;;
+  servicenow-list) servicenow_list ;;
+  servicenow-webhook|servicenow-update-webhook) servicenow_webhook ;;
+  servicenow-verify|servicenow-verify-webhook) servicenow_verify ;;
   agent-stack|provision-agent-stack)
     require_env agent-stack
     provision_agent_stack

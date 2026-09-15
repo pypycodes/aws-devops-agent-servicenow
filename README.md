@@ -145,6 +145,22 @@ WEBHOOK_SECRET=<your-secret>
 
 > **Note:** See the [AWS DevOps Agent CLI onboarding guide](https://docs.aws.amazon.com/devopsagent/latest/userguide/getting-started-with-aws-devops-agent-cli-onboarding-guide.html) to create an agent space and get webhook credentials.
 
+If ServiceNow should forward newly created incidents to AWS DevOps Agent, create these ServiceNow `sys_properties` first:
+
+```text
+aws.devopsagent.webhook.url
+aws.devopsagent.webhook.secret
+```
+
+Then update them from `.env`:
+
+```bash
+./doa.sh servicenow-webhook
+./doa.sh servicenow-verify
+```
+
+When `ENABLE_SERVICENOW=true`, `./doa.sh deploy` also updates these ServiceNow webhook properties before deploying the infrastructure stack. The verification command redacts the HMAC secret.
+
 Use the devops-agent-stack.yaml and apply the cloudformation stack for agent space:
 aws cloudformation deploy \
   --template-file devops-agent-stack.yaml \
