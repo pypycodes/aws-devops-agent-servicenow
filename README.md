@@ -162,13 +162,16 @@ Then update them from `.env`:
 When `ENABLE_SERVICENOW=true`, `./doa.sh deploy` also updates these ServiceNow webhook properties before deploying the infrastructure stack. The verification command redacts the HMAC secret.
 
 Use the `cloud-formation/devops-agent-stack.yaml` template and apply the CloudFormation stack for the agent space:
+
 ```bash
 aws cloudformation deploy \
   --template-file cloud-formation/devops-agent-stack.yaml \
-  --stack-name CTDevOpsAgentStack \
+  --stack-name dev-agent-space \
   --capabilities CAPABILITY_NAMED_IAM \
   --region us-east-1
 ```
+
+The `./doa.sh agent-stack` command derives this stack name from `ENV`, for example `dev-agent-space`.
 
 Post that create the webhook via console (its not supported via CF Template) and pre-fill the .env file with details.
 
@@ -323,6 +326,9 @@ Remove all deployed resources:
 | `./doa.sh deploy-usecase ec2` | Deploy the EC2 CPU stress use case stack |
 | `./doa.sh deploy-usecase eks` | Deploy the EKS node health use case stack |
 | `./doa.sh deploy` | Deploy shared routing and the DynamoDB use case |
+| `./doa.sh cleanup-usecase dynamodb` | Delete only the DynamoDB use case stack |
+| `./doa.sh cleanup-usecase ec2` | Delete only the EC2 use case stack |
+| `./doa.sh cleanup-usecase eks` | Delete only the EKS use case stack |
 | `./doa.sh verify` | Verify all resources exist |
 | `./doa.sh trigger` | Inject DynamoDB throttling fault |
 | `./doa.sh restore` | Restore DynamoDB to on-demand |

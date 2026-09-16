@@ -31,6 +31,7 @@ usage() {
     shared-incident     Deploy shared SNS + incident Lambda routing
     deploy-usecase NAME Deploy a use case stack (dynamodb, ec2, eks)
     deploy       Deploy shared incident routing + DynamoDB demo use case
+    cleanup-usecase NAME Delete one use case stack (dynamodb, ec2, eks)
     verify       Verify resources
     servicenow-test     Test ServiceNow OAuth authentication
     servicenow-list     List ServiceNow webhook sys_properties
@@ -67,6 +68,7 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=""
 BUCKET=""
 STACK_NAME=""
+AGENT_STACK_NAME=""
 INCIDENT_STACK_NAME=""
 DYNAMODB_STACK_NAME=""
 EC2_STACK_NAME=""
@@ -299,6 +301,7 @@ init() {
     ACCOUNT_ID="$(aws sts get-caller-identity --region "$REGION" --query Account --output text --no-cli-pager)" || \
       fail "Unable to read AWS account identity for profile ${AWS_PROFILE:-default}"
     BUCKET="${ENV}-devops-agent-demo-${ACCOUNT_ID}"
+    AGENT_STACK_NAME="${ENV}-agent-space"
     INCIDENT_STACK_NAME="${ENV}-incident-routing"
     DYNAMODB_STACK_NAME="${ENV}-usecase-dynamodb"
     EC2_STACK_NAME="${ENV}-usecase-ec2"
@@ -360,6 +363,15 @@ stack_output() {
     --stack-name "$stack_name" --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='$output_key'].OutputValue | [0]" \
     --output text --no-cli-pager 2>/dev/null || true
+}
+
+agent_stack_output() {
+  local output_key="$1" value
+  value="$(stack_output "$AGENT_STACK_NAME" "$output_key")"
+  if [[ -z "$value" || "$value" == "None" ]]; then
+    value="$(stack_output CTDevOpsAgentStack "$output_key")"
+  fi
+  printf '%s' "$value"
 }
 
 header() {
@@ -447,13 +459,17 @@ provision_agent_stack() {
   validate_servicenow_config "${ENABLE_SERVICENOW:-false}"
   header "Provision DevOps Agent Stack"
 
-  local agent_stack="CTDevOpsAgentStack"
-  local agent_space_name="${ENV}-CTDevOpsAgentSpace"
+  local agent_space_name="${ENV}-agent-space"
   local confirm
+
+  if aws cloudformation describe-stacks --stack-name CTDevOpsAgentStack --region "$REGION" --no-cli-pager >/dev/null 2>&1 && \
+     ! aws cloudformation describe-stacks --stack-name "$AGENT_STACK_NAME" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    fail "Legacy agent stack CTDevOpsAgentStack already exists. Delete or migrate it before creating $AGENT_STACK_NAME. CloudFormation cannot rename stacks in place."
+  fi
 
   echo -e "  ${D}Account:${N} $ACCOUNT_ID"
   echo -e "  ${D}Region:${N} $REGION"
-  echo -e "  ${D}Stack:${N} $agent_stack"
+  echo -e "  ${D}Stack:${N} $AGENT_STACK_NAME"
   echo -e "  ${D}Agent space:${N} $agent_space_name"
   read -rp "  Proceed? [y/N] " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
@@ -461,11 +477,11 @@ provision_agent_stack() {
   if spin "Provisioning DevOps Agent stack..." \
     aws cloudformation deploy \
       --template-file "$CFN_DIR/devops-agent-stack.yaml" \
-      --stack-name "$agent_stack" \
+      --stack-name "$AGENT_STACK_NAME" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides \
         AgentSpaceName="$agent_space_name" \
-        AgentSpaceDescription="Agent space deployed with CloudFormation for ${ENV} CT DevOpsAgent Demo" \
+        AgentSpaceDescription="${ENV} shared agent space for the DevOps Agent incident factory" \
         EnableServiceNow="${ENABLE_SERVICENOW:-false}" \
         ServiceNowInstanceUrl="${SERVICENOW_INSTANCE_URL:-}" \
         ServiceNowClientName="${SERVICENOW_CLIENT_NAME:-AWS DevOps Agent ServiceNow Integration}" \
@@ -499,7 +515,7 @@ deploy_shared_incident_stack() {
   fi
   package_lambda_artifacts incident
 
-  agent_topic_arn="$(stack_output CTDevOpsAgentStack DevOpsAgentNotificationTopicArn)"
+  agent_topic_arn="$(agent_stack_output DevOpsAgentNotificationTopicArn)"
   [[ "$agent_topic_arn" == "None" ]] && agent_topic_arn=""
   preflight_resource_conflicts incident
 
@@ -546,7 +562,7 @@ ensure_shared_incident_stack() {
   preflight_resource_conflicts incident
   package_lambda_artifacts incident
 
-  agent_topic_arn="$(stack_output CTDevOpsAgentStack DevOpsAgentNotificationTopicArn)"
+  agent_topic_arn="$(agent_stack_output DevOpsAgentNotificationTopicArn)"
   [[ "$agent_topic_arn" == "None" ]] && agent_topic_arn=""
 
   if spin "Deploying shared incident routing stack..." \
@@ -686,6 +702,53 @@ deploy_usecase() {
   esac
 }
 
+usecase_stack_name() {
+  local usecase="$1"
+
+  case "$usecase" in
+    dynamodb|dynamodb-simple-lambda)
+      printf '%s' "$DYNAMODB_STACK_NAME"
+      ;;
+    ec2|ec2-cpu-stress)
+      printf '%s' "$EC2_STACK_NAME"
+      ;;
+    eks|eks-node-health)
+      printf '%s' "$EKS_STACK_NAME"
+      ;;
+    *)
+      fail "Unknown use case: $usecase. Available use cases: dynamodb, ec2, eks"
+      ;;
+  esac
+}
+
+cleanup_usecase() {
+  local usecase="${1:-}" stack_name confirm
+  [[ -n "$usecase" ]] || fail "Usage: ./doa.sh cleanup-usecase <dynamodb|ec2|eks>"
+
+  init
+  stack_name="$(usecase_stack_name "$usecase")"
+  header "Cleanup Use Case"
+
+  echo -e "  ${R}${B}This deletes only:${N} $stack_name"
+  echo -e "  ${D}Preserved:${N} $INCIDENT_STACK_NAME and $AGENT_STACK_NAME"
+  read -rp "  Proceed with use case cleanup? [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
+
+  if [[ "$stack_name" == "$DYNAMODB_STACK_NAME" ]]; then
+    aws events disable-rule --name "${ENV}-simple-lambda-schedule" --region "$REGION" --no-cli-pager 2>/dev/null || true
+  fi
+
+  if aws cloudformation describe-stacks --stack-name "$stack_name" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "$stack_name" --region "$REGION" --no-cli-pager
+    spin "Deleting $usecase use case stack..." aws cloudformation wait stack-delete-complete --stack-name "$stack_name" --region "$REGION" --no-cli-pager || \
+      warn "$usecase use case stack deletion did not complete cleanly"
+  else
+    warn "Stack not found: $stack_name"
+  fi
+
+  ok "Use case cleanup completed"
+}
+
 deploy() {
   if servicenow_incidents_enabled; then
     validate_servicenow_config
@@ -708,7 +771,7 @@ deploy() {
   preflight_resource_conflicts
   package_lambda_artifacts incident
 
-  agent_topic_arn="$(stack_output CTDevOpsAgentStack DevOpsAgentNotificationTopicArn)"
+  agent_topic_arn="$(agent_stack_output DevOpsAgentNotificationTopicArn)"
   [[ "$agent_topic_arn" == "None" ]] && agent_topic_arn=""
 
   if spin "Deploying shared incident routing stack..." \
@@ -759,7 +822,7 @@ deploy() {
 track() {
   init
   header "Stack Status"
-  for stack_name in "$INCIDENT_STACK_NAME" "$DYNAMODB_STACK_NAME" "$EC2_STACK_NAME" "$EKS_STACK_NAME"; do
+  for stack_name in "$AGENT_STACK_NAME" "$INCIDENT_STACK_NAME" "$DYNAMODB_STACK_NAME" "$EC2_STACK_NAME" "$EKS_STACK_NAME"; do
     echo -e "  ${D}Stack:${N} $stack_name"
     aws cloudformation describe-stacks --stack-name "$stack_name" --region "$REGION" \
       --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' --output json --no-cli-pager 2>/dev/null || \
@@ -929,10 +992,9 @@ cleanup() {
   init
   header "Cleanup"
   local config_bucket="${ENV}-simple-lambda-config-${ACCOUNT_ID}"
-  local agent_stack="CTDevOpsAgentStack"
   local confirm
 
-  echo -e "  ${R}${B}This deletes:${N} $EKS_STACK_NAME, $EC2_STACK_NAME, $DYNAMODB_STACK_NAME, $INCIDENT_STACK_NAME, $agent_stack, $config_bucket and $BUCKET"
+  echo -e "  ${R}${B}This deletes:${N} $EKS_STACK_NAME, $EC2_STACK_NAME, $DYNAMODB_STACK_NAME, $INCIDENT_STACK_NAME, $AGENT_STACK_NAME, $config_bucket and $BUCKET"
   read -rp "  Proceed with cleanup? [y/N] " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
 
@@ -969,9 +1031,9 @@ cleanup() {
       warn "Shared incident routing stack deletion did not complete cleanly"
   fi
 
-  if aws cloudformation describe-stacks --stack-name "$agent_stack" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
-    aws cloudformation delete-stack --stack-name "$agent_stack" --region "$REGION" --no-cli-pager
-    spin "Deleting agent stack..." aws cloudformation wait stack-delete-complete --stack-name "$agent_stack" --region "$REGION" --no-cli-pager || \
+  if aws cloudformation describe-stacks --stack-name "$AGENT_STACK_NAME" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "$AGENT_STACK_NAME" --region "$REGION" --no-cli-pager
+    spin "Deleting agent stack..." aws cloudformation wait stack-delete-complete --stack-name "$AGENT_STACK_NAME" --region "$REGION" --no-cli-pager || \
       warn "Agent stack deletion did not complete cleanly"
   fi
 
@@ -999,6 +1061,10 @@ case "$command" in
   deploy-usecase)
     require_env
     deploy_usecase "$@"
+    ;;
+  cleanup-usecase)
+    require_env
+    cleanup_usecase "$@"
     ;;
   deploy|trigger|restore|track|verify|cleanup|alarms)
     require_env

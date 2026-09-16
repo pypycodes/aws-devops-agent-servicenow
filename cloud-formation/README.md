@@ -17,7 +17,7 @@ cloud-formation/
 
 ## Stack Contract
 
-`devops-agent-stack.yaml` creates the shared AWS DevOps Agent space.
+`devops-agent-stack.yaml` creates the shared AWS DevOps Agent space. The `doa.sh` wrapper deploys it as `{env}-agent-space`, for example `dev-agent-space`.
 
 `shared/incident-routing.yaml` creates the reusable incident routing layer:
 
@@ -43,6 +43,14 @@ Deploy a single use case with:
 ./doa.sh deploy-usecase dynamodb
 ./doa.sh deploy-usecase ec2
 ./doa.sh deploy-usecase eks
+```
+
+Delete a single use case while preserving shared incident routing and the agent space with:
+
+```bash
+./doa.sh cleanup-usecase dynamodb
+./doa.sh cleanup-usecase ec2
+./doa.sh cleanup-usecase eks
 ```
 
 `deploy-usecase` creates the shared incident routing stack first when it is missing. If `ENABLE_SERVICENOW=true`, that shared stack deploys the ServiceNow incident Lambda and subscribes it to the shared SNS topic. If `ENABLE_SERVICENOW=false`, it deploys the webhook Lambda and subscribes that Lambda instead.

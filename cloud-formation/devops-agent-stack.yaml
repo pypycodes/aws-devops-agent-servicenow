@@ -1,15 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: AWS DevOps Agent - Agent Space with IAM roles, operator app, and AWS association
+Description: AWS DevOps Agent Demo - Shared agent space for the incident factory
 
 Parameters:
   AgentSpaceName:
     Type: String
-    Default: CTDevOpsAgentSpace
-    Description: CTDevOpsAgentSpace
+    Default: demo-agent-space
+    Description: Shared AWS DevOps Agent space name
   AgentSpaceDescription:
     Type: String
-    Default: Agent space deployed with CloudFormation for CT DevOpsAgent Demo
-    Description: CT DevOpsAgent Demo
+    Default: Shared agent space for the DevOps Agent incident factory
+    Description: Shared AWS DevOps Agent space description
   NotificationEmail:
     Type: String
     Default: ''
