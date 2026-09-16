@@ -1,4 +1,5 @@
 const MAX_FIELD_LENGTH = 4000;
+const OPEN_INCIDENT_STATES = new Set(["1", "2", "3", "new", "in progress", "in-progress", "on hold", "on-hold"]);
 
 function sanitize(value, maxLength = MAX_FIELD_LENGTH) {
   if (typeof value !== "string") return "";
@@ -7,6 +8,22 @@ function sanitize(value, maxLength = MAX_FIELD_LENGTH) {
 
 function present(value) {
   return typeof value === "string" && value !== "" && value !== "null" && value !== "undefined";
+}
+
+function incidentStateValue(incident) {
+  const state = incident?.state;
+  if (state && typeof state === "object") return state.value || state.display_value || "";
+  return String(state || "");
+}
+
+function incidentStateLabel(incident) {
+  const state = incident?.state;
+  if (state && typeof state === "object") return state.display_value || state.value || "unknown";
+  return String(state || "unknown");
+}
+
+function isOpenIncident(incident) {
+  return OPEN_INCIDENT_STATES.has(incidentStateValue(incident).trim().toLowerCase());
 }
 
 function messageFromRecord(record) {
@@ -110,14 +127,18 @@ export const handler = async (event) => {
       continue;
     }
 
-    const encodedArn = encodeURIComponent(alarm.AlarmArn);
+    const query = encodeURIComponent(`correlation_id=${alarm.AlarmArn}^active=true`);
     const existing = await serviceNowRequest(
-      `/api/now/table/incident?sysparm_query=correlation_id=${encodedArn}&sysparm_limit=1&sysparm_fields=sys_id,number`,
+      `/api/now/table/incident?sysparm_query=${query}&sysparm_limit=10&sysparm_fields=sys_id,number,state&sysparm_display_value=all`,
       token,
     );
-    if (existing.result?.length) {
-      console.log(`Incident already exists for ${alarm.AlarmArn}: ${existing.result[0].number}`);
+    const openIncident = existing.result?.find(isOpenIncident);
+    if (openIncident) {
+      console.log(`Open ServiceNow incident already exists for ${alarm.AlarmArn}: ${openIncident.number} state=${incidentStateLabel(openIncident)}`);
       continue;
+    }
+    if (existing.result?.length) {
+      console.log(`Existing incidents for ${alarm.AlarmArn} are not New, In Progress, or On Hold; creating a new incident`);
     }
 
     const incident = await serviceNowRequest("/api/now/table/incident", token, {
