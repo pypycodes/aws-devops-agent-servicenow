@@ -8,6 +8,14 @@ Parameters:
   IncidentTopicArn:
     Type: String
     Description: Shared incident routing SNS topic ARN
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    Description: CIDR block for the private stress-test VPC
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.42.1.0/24
+    Description: CIDR block for the private stress-test subnet
   InstanceType:
     Type: String
     Default: t3.nano
@@ -35,7 +43,7 @@ Resources:
   Vpc:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: 10.42.0.0/16
+      CidrBlock: !Ref VpcCidr
       EnableDnsHostnames: true
       EnableDnsSupport: true
       Tags:
@@ -43,68 +51,100 @@ Resources:
         - { Key: Environment, Value: !Ref Env }
         - { Key: UseCase, Value: ec2-cpu-stress }
 
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-    Properties:
-      Tags:
-        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-igw' }
-        - { Key: Environment, Value: !Ref Env }
-        - { Key: UseCase, Value: ec2-cpu-stress }
-
-  VpcGatewayAttachment:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref Vpc
-      InternetGatewayId: !Ref InternetGateway
-
-  PublicSubnet:
+  PrivateSubnet:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref Vpc
-      CidrBlock: 10.42.1.0/24
-      MapPublicIpOnLaunch: true
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
       AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
-        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-public-a' }
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-private-a' }
         - { Key: Environment, Value: !Ref Env }
         - { Key: UseCase, Value: ec2-cpu-stress }
 
-  PublicRouteTable:
+  PrivateRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
       Tags:
-        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-public-rt' }
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-private-rt' }
         - { Key: Environment, Value: !Ref Env }
         - { Key: UseCase, Value: ec2-cpu-stress }
 
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: VpcGatewayAttachment
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-
-  PublicSubnetRouteTableAssociation:
+  PrivateSubnetRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
 
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: EC2 CPU stress instance without inbound access
+      GroupDescription: EC2 CPU stress instance private access only
       VpcId: !Ref Vpc
-      SecurityGroupIngress: []
       SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
+        - Description: HTTPS to private VPC endpoints
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
       Tags:
         - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-sg' }
         - { Key: Environment, Value: !Ref Env }
         - { Key: UseCase, Value: ec2-cpu-stress }
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSM interface endpoint access from the private stress instance
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: HTTPS from stress instance only
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-vpce-sg' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: ec2-cpu-stress }
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
 
   InstanceRole:
     Type: AWS::IAM::Role
@@ -133,7 +173,7 @@ Resources:
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref InstanceProfile
-      SubnetId: !Ref PublicSubnet
+      SubnetId: !Ref PrivateSubnet
       SecurityGroupIds:
         - !Ref InstanceSecurityGroup
       MetadataOptions:
@@ -143,7 +183,7 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -euxo pipefail
-          cat >/opt/cpu-stress.py <<'PY'
+          cat >/tmp/stress.py <<'PY'
           import math
           import time
 
@@ -152,7 +192,8 @@ Resources:
               for value in range(250000):
                   math.sqrt(value)
           PY
-          nohup python3 /opt/cpu-stress.py >/var/log/cpu-stress.log 2>&1 &
+          chmod 700 /tmp/stress.py
+          nohup python3 /tmp/stress.py >/var/log/cpu-stress.log 2>&1 &
       Tags:
         - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress' }
         - { Key: Environment, Value: !Ref Env }
@@ -187,5 +228,11 @@ Outputs:
     Value: !Ref CpuSpikeAlarm
   VpcId:
     Value: !Ref Vpc
-  PublicSubnetId:
-    Value: !Ref PublicSubnet
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
+  SsmEndpointId:
+    Value: !Ref SsmEndpoint
+  SsmMessagesEndpointId:
+    Value: !Ref SsmMessagesEndpoint
+  Ec2MessagesEndpointId:
+    Value: !Ref Ec2MessagesEndpoint
