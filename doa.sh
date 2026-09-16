@@ -28,7 +28,9 @@ usage() {
   Commands:
     pre          Check prerequisites
     agent-stack  Provision the AWS DevOps Agent stack
-    deploy       Deploy the demo infrastructure only
+    shared-incident     Deploy shared SNS + incident Lambda routing
+    deploy-usecase NAME Deploy a use case stack (dynamodb, ec2, eks)
+    deploy       Deploy shared incident routing + DynamoDB demo use case
     verify       Verify resources
     servicenow-test     Test ServiceNow OAuth authentication
     servicenow-list     List ServiceNow webhook sys_properties
@@ -65,6 +67,10 @@ REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=""
 BUCKET=""
 STACK_NAME=""
+INCIDENT_STACK_NAME=""
+DYNAMODB_STACK_NAME=""
+EC2_STACK_NAME=""
+EKS_STACK_NAME=""
 SERVICENOW_WEBHOOK_URL_PROPERTY="aws.devopsagent.webhook.url"
 SERVICENOW_WEBHOOK_SECRET_PROPERTY="aws.devopsagent.webhook.secret"
 
@@ -226,10 +232,10 @@ servicenow_update_webhook_properties() {
 }
 
 stack_owns_resource() {
-  local logical_id="$1" physical_id="$2" actual_id
+  local stack_name="$1" logical_id="$2" physical_id="$3" actual_id
 
   actual_id="$(aws cloudformation describe-stack-resource \
-    --stack-name "$STACK_NAME" \
+    --stack-name "$stack_name" \
     --logical-resource-id "$logical_id" \
     --region "$REGION" \
     --query 'StackResourceDetail.PhysicalResourceId' \
@@ -239,7 +245,7 @@ stack_owns_resource() {
 }
 
 check_log_group_conflict() {
-  local logical_id="$1" log_group_name="$2" existing_log_group
+  local stack_name="$1" logical_id="$2" log_group_name="$3" existing_log_group
 
   existing_log_group="$(aws logs describe-log-groups \
     --log-group-name-prefix "$log_group_name" \
@@ -247,19 +253,25 @@ check_log_group_conflict() {
     --query "logGroups[?logGroupName=='$log_group_name'].logGroupName | [0]" \
     --output text --no-cli-pager)"
 
-  if [[ "$existing_log_group" != "None" ]] && ! stack_owns_resource "$logical_id" "$log_group_name"; then
+  if [[ "$existing_log_group" != "None" ]] && ! stack_owns_resource "$stack_name" "$logical_id" "$log_group_name"; then
     fail "CloudWatch log group already exists outside stack: $log_group_name. Delete it or choose a new ENV before deploying."
   fi
 }
 
 preflight_resource_conflicts() {
+  local scope="${1:-all}"
   step "Checking for orphaned CloudWatch log groups"
-  check_log_group_conflict LambdaLogGroup "/aws/lambda/${ENV}-simple-lambda"
 
-  if servicenow_incidents_enabled; then
-    check_log_group_conflict ServiceNowIncidentLogGroup "/aws/lambda/${ENV}-servicenow-incident"
-  else
-    check_log_group_conflict WebhookLogGroup "/aws/lambda/${ENV}-devops-agent-webhook"
+  if [[ "$scope" == "all" || "$scope" == "dynamodb" ]]; then
+    check_log_group_conflict "$DYNAMODB_STACK_NAME" LambdaLogGroup "/aws/lambda/${ENV}-simple-lambda"
+  fi
+
+  if [[ "$scope" == "all" || "$scope" == "incident" ]]; then
+    if servicenow_incidents_enabled; then
+      check_log_group_conflict "$INCIDENT_STACK_NAME" ServiceNowIncidentLogGroup "/aws/lambda/${ENV}-servicenow-incident"
+    else
+      check_log_group_conflict "$INCIDENT_STACK_NAME" WebhookLogGroup "/aws/lambda/${ENV}-devops-agent-webhook"
+    fi
   fi
 
   ok "No orphaned log group conflicts found"
@@ -287,8 +299,67 @@ init() {
     ACCOUNT_ID="$(aws sts get-caller-identity --region "$REGION" --query Account --output text --no-cli-pager)" || \
       fail "Unable to read AWS account identity for profile ${AWS_PROFILE:-default}"
     BUCKET="${ENV}-devops-agent-demo-${ACCOUNT_ID}"
-    STACK_NAME="${ENV}-devops-agent-demo"
+    INCIDENT_STACK_NAME="${ENV}-incident-routing"
+    DYNAMODB_STACK_NAME="${ENV}-usecase-dynamodb"
+    EC2_STACK_NAME="${ENV}-usecase-ec2"
+    EKS_STACK_NAME="${ENV}-usecase-eks"
+    STACK_NAME="$DYNAMODB_STACK_NAME"
   fi
+}
+
+ensure_code_bucket() {
+  step "Creating code bucket: $BUCKET"
+  if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1; then
+    ok "Bucket exists"
+  else
+    if [[ "$REGION" == "us-east-1" ]]; then
+      aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" --no-cli-pager >/dev/null
+    else
+      aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+        --create-bucket-configuration "LocationConstraint=$REGION" --no-cli-pager >/dev/null
+    fi
+    ok "Bucket created"
+  fi
+}
+
+package_lambda_artifacts() {
+  local mode="$1" package_dir
+  package_dir="$(mktemp -d)"
+
+  case "$mode" in
+    incident)
+      step "Packaging shared incident Lambda functions"
+      if servicenow_incidents_enabled; then
+        (cd "$SCRIPT_DIR/lambdas/servicenow-incident" && zip -q -j "$package_dir/servicenow-incident-lambda.zip" index.mjs)
+        aws s3 cp "$package_dir/servicenow-incident-lambda.zip" "s3://$BUCKET/servicenow-incident-lambda.zip" --region "$REGION" --quiet
+        echo -e "  ${D}Alarm trigger:${N} ServiceNow incident Lambda"
+      else
+        (cd "$SCRIPT_DIR/lambdas/webhook" && zip -q -j "$package_dir/webhook-lambda.zip" index.mjs)
+        aws s3 cp "$package_dir/webhook-lambda.zip" "s3://$BUCKET/webhook-lambda.zip" --region "$REGION" --quiet
+        echo -e "  ${D}Alarm trigger:${N} webhook Lambda → DevOps Agent"
+      fi
+      ;;
+    dynamodb)
+      step "Packaging DynamoDB use case Lambda function"
+      (cd "$SCRIPT_DIR/lambdas/app" && zip -q -j "$package_dir/simple-lambda.zip" simple_lambda.py)
+      aws s3 cp "$package_dir/simple-lambda.zip" "s3://$BUCKET/simple-lambda.zip" --region "$REGION" --quiet
+      ;;
+    *)
+      rm -rf "$package_dir"
+      fail "Unknown Lambda artifact package mode: $mode"
+      ;;
+  esac
+
+  rm -rf "$package_dir"
+  ok "Lambda packages uploaded"
+}
+
+stack_output() {
+  local stack_name="$1" output_key="$2"
+  aws cloudformation describe-stacks \
+    --stack-name "$stack_name" --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='$output_key'].OutputValue | [0]" \
+    --output text --no-cli-pager 2>/dev/null || true
 }
 
 header() {
@@ -409,68 +480,37 @@ provision_agent_stack() {
   fi
 }
 
-deploy() {
+deploy_shared_incident_stack() {
   if servicenow_incidents_enabled; then
     validate_servicenow_config
   else
     validate_webhook_config
   fi
   init
-  header "Deploy Infrastructure"
-  preflight_resource_conflicts
+  header "Deploy Shared Incident Routing"
 
-  local confirm agent_topic_arn package_dir
-  read -rp "  Deploy $STACK_NAME in account $ACCOUNT_ID? [y/N] " confirm
+  local confirm agent_topic_arn
+  read -rp "  Deploy $INCIDENT_STACK_NAME in account $ACCOUNT_ID? [y/N] " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
 
+  ensure_code_bucket
   if servicenow_incidents_enabled; then
     servicenow_update_webhook_properties
   fi
+  package_lambda_artifacts incident
 
-  package_dir="$(mktemp -d)"
-
-  step "Creating code bucket: $BUCKET"
-  if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1; then
-    ok "Bucket exists"
-  else
-    if [[ "$REGION" == "us-east-1" ]]; then
-      aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" --no-cli-pager >/dev/null
-    else
-      aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
-        --create-bucket-configuration "LocationConstraint=$REGION" --no-cli-pager >/dev/null
-    fi
-    ok "Bucket created"
-  fi
-
-  step "Packaging and uploading Lambda functions"
-  (cd "$SCRIPT_DIR/lambdas/app" && zip -q -j "$package_dir/simple-lambda.zip" simple_lambda.py)
-  aws s3 cp "$package_dir/simple-lambda.zip" "s3://$BUCKET/simple-lambda.zip" --region "$REGION" --quiet
-  if servicenow_incidents_enabled; then
-    (cd "$SCRIPT_DIR/lambdas/servicenow-incident" && zip -q -j "$package_dir/servicenow-incident-lambda.zip" index.mjs)
-    aws s3 cp "$package_dir/servicenow-incident-lambda.zip" "s3://$BUCKET/servicenow-incident-lambda.zip" --region "$REGION" --quiet
-    echo -e "  ${D}Alarm trigger:${N} ServiceNow incident Lambda (webhook Lambda omitted)"
-  else
-    (cd "$SCRIPT_DIR/lambdas/webhook" && zip -q -j "$package_dir/webhook-lambda.zip" index.mjs)
-    aws s3 cp "$package_dir/webhook-lambda.zip" "s3://$BUCKET/webhook-lambda.zip" --region "$REGION" --quiet
-    echo -e "  ${D}Alarm trigger:${N} webhook Lambda → DevOps Agent (ServiceNow incident Lambda omitted)"
-  fi
-  ok "Lambda packages uploaded"
-  rm -rf "$package_dir"
-
-  agent_topic_arn="$(aws cloudformation describe-stacks \
-    --stack-name CTDevOpsAgentStack --region "$REGION" \
-    --query "Stacks[0].Outputs[?OutputKey=='DevOpsAgentNotificationTopicArn'].OutputValue | [0]" \
-    --output text --no-cli-pager 2>/dev/null || true)"
+  agent_topic_arn="$(stack_output CTDevOpsAgentStack DevOpsAgentNotificationTopicArn)"
   [[ "$agent_topic_arn" == "None" ]] && agent_topic_arn=""
+  preflight_resource_conflicts incident
 
-  if spin "Deploying infrastructure stack..." \
+  if spin "Deploying shared incident routing stack..." \
     aws cloudformation deploy \
-      --template-file "$CFN_DIR/template.yaml" \
-      --stack-name "$STACK_NAME" \
+      --template-file "$CFN_DIR/shared/incident-routing.yaml" \
+      --stack-name "$INCIDENT_STACK_NAME" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides \
         Env="$ENV" WebhookUrl="${WEBHOOK_URL:-}" WebhookSecretParam="${WEBHOOK_SECRET:-}" \
-        LambdaCodeBucket="$BUCKET" AppCodeKey=simple-lambda.zip \
+        LambdaCodeBucket="$BUCKET" \
         WebhookCodeKey=webhook-lambda.zip \
         ServiceNowIncidentCodeKey=servicenow-incident-lambda.zip \
         EnableServiceNow="${ENABLE_SERVICENOW:-false}" \
@@ -479,9 +519,238 @@ deploy() {
         ServiceNowClientSecret="${SERVICENOW_CLIENT_SECRET:-}" \
         DevOpsAgentNotificationTopicArn="$agent_topic_arn" \
       --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
-    ok "Infrastructure stack deployed"
+    ok "Shared incident routing deployed"
   else
-    fail "Infrastructure stack deployment failed"
+    fail "Shared incident routing deployment failed"
+  fi
+}
+
+ensure_shared_incident_stack() {
+  local incident_topic_arn agent_topic_arn
+
+  incident_topic_arn="$(stack_output "$INCIDENT_STACK_NAME" IncidentTopicArn)"
+  if [[ -n "$incident_topic_arn" && "$incident_topic_arn" != "None" ]]; then
+    ok "Shared incident routing stack exists: $INCIDENT_STACK_NAME"
+    return 0
+  fi
+
+  step "Shared incident routing stack missing; deploying $INCIDENT_STACK_NAME"
+  if servicenow_incidents_enabled; then
+    validate_servicenow_config
+    servicenow_update_webhook_properties
+  else
+    validate_webhook_config
+  fi
+
+  ensure_code_bucket
+  preflight_resource_conflicts incident
+  package_lambda_artifacts incident
+
+  agent_topic_arn="$(stack_output CTDevOpsAgentStack DevOpsAgentNotificationTopicArn)"
+  [[ "$agent_topic_arn" == "None" ]] && agent_topic_arn=""
+
+  if spin "Deploying shared incident routing stack..." \
+    aws cloudformation deploy \
+      --template-file "$CFN_DIR/shared/incident-routing.yaml" \
+      --stack-name "$INCIDENT_STACK_NAME" \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides \
+        Env="$ENV" WebhookUrl="${WEBHOOK_URL:-}" WebhookSecretParam="${WEBHOOK_SECRET:-}" \
+        LambdaCodeBucket="$BUCKET" \
+        WebhookCodeKey=webhook-lambda.zip \
+        ServiceNowIncidentCodeKey=servicenow-incident-lambda.zip \
+        EnableServiceNow="${ENABLE_SERVICENOW:-false}" \
+        ServiceNowInstanceUrl="${SERVICENOW_INSTANCE_URL:-}" \
+        ServiceNowClientId="${SERVICENOW_CLIENT_ID:-}" \
+        ServiceNowClientSecret="${SERVICENOW_CLIENT_SECRET:-}" \
+        DevOpsAgentNotificationTopicArn="$agent_topic_arn" \
+      --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
+    ok "Shared incident routing deployed"
+  else
+    fail "Shared incident routing deployment failed"
+  fi
+}
+
+deploy_dynamodb_usecase() {
+  init
+  header "Deploy DynamoDB Use Case"
+
+  local confirm incident_topic_arn
+  read -rp "  Deploy $DYNAMODB_STACK_NAME in account $ACCOUNT_ID? Shared routing will be created if missing. [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
+
+  ensure_shared_incident_stack
+  incident_topic_arn="$(stack_output "$INCIDENT_STACK_NAME" IncidentTopicArn)"
+  [[ -n "$incident_topic_arn" && "$incident_topic_arn" != "None" ]] || \
+    fail "Shared incident routing stack is missing. Run: ./doa.sh shared-incident"
+
+  preflight_resource_conflicts dynamodb
+  ensure_code_bucket
+  package_lambda_artifacts dynamodb
+
+  if spin "Deploying DynamoDB use case stack..." \
+    aws cloudformation deploy \
+      --template-file "$CFN_DIR/usecases/dynamodb-simple-lambda.yaml" \
+      --stack-name "$DYNAMODB_STACK_NAME" \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides \
+        Env="$ENV" \
+        LambdaCodeBucket="$BUCKET" \
+        AppCodeKey=simple-lambda.zip \
+        IncidentTopicArn="$incident_topic_arn" \
+      --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
+    ok "DynamoDB use case deployed"
+  else
+    fail "DynamoDB use case deployment failed"
+  fi
+
+  verify
+}
+
+deploy_ec2_usecase() {
+  init
+  header "Deploy EC2 CPU Stress Use Case"
+
+  local confirm incident_topic_arn
+  echo -e "  ${D}Instance:${N} t3.nano"
+  echo -e "  ${D}Alarm:${N} ${ENV}-EC2-CPU-Spike"
+  read -rp "  Deploy $EC2_STACK_NAME in account $ACCOUNT_ID? Shared routing will be created if missing. [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
+
+  ensure_shared_incident_stack
+  incident_topic_arn="$(stack_output "$INCIDENT_STACK_NAME" IncidentTopicArn)"
+  [[ -n "$incident_topic_arn" && "$incident_topic_arn" != "None" ]] || \
+    fail "Shared incident routing stack is missing. Run: ./doa.sh shared-incident"
+
+  if spin "Deploying EC2 CPU stress use case stack..." \
+    aws cloudformation deploy \
+      --template-file "$CFN_DIR/usecases/ec2-cpu-stress.yaml" \
+      --stack-name "$EC2_STACK_NAME" \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides \
+        Env="$ENV" \
+        IncidentTopicArn="$incident_topic_arn" \
+      --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
+    ok "EC2 CPU stress use case deployed"
+  else
+    fail "EC2 CPU stress use case deployment failed"
+  fi
+}
+
+deploy_eks_usecase() {
+  init
+  header "Deploy EKS Node Health Use Case"
+
+  local confirm incident_topic_arn
+  echo -e "  ${Y}⚠${N} EKS creates billable control plane and worker node resources. Deployment can take 15-25 minutes."
+  echo -e "  ${D}Alarms:${N} ${ENV}-EKS-Node-Memory-High, ${ENV}-EKS-Pod-Restarts, ${ENV}-EKS-Node-NotReady"
+  read -rp "  Deploy $EKS_STACK_NAME in account $ACCOUNT_ID? Shared routing will be created if missing. [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
+
+  ensure_shared_incident_stack
+  incident_topic_arn="$(stack_output "$INCIDENT_STACK_NAME" IncidentTopicArn)"
+  [[ -n "$incident_topic_arn" && "$incident_topic_arn" != "None" ]] || \
+    fail "Shared incident routing stack is missing. Run: ./doa.sh shared-incident"
+
+  if spin "Deploying EKS node health use case stack..." \
+    aws cloudformation deploy \
+      --template-file "$CFN_DIR/usecases/eks-node-health.yaml" \
+      --stack-name "$EKS_STACK_NAME" \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides \
+        Env="$ENV" \
+        IncidentTopicArn="$incident_topic_arn" \
+      --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
+    ok "EKS node health use case deployed"
+  else
+    fail "EKS node health use case deployment failed"
+  fi
+}
+
+deploy_usecase() {
+  local usecase="${1:-dynamodb}"
+
+  case "$usecase" in
+    dynamodb|dynamodb-simple-lambda)
+      deploy_dynamodb_usecase
+      ;;
+    ec2|ec2-cpu-stress)
+      deploy_ec2_usecase
+      ;;
+    eks|eks-node-health)
+      deploy_eks_usecase
+      ;;
+    *)
+      fail "Unknown use case: $usecase. Available use cases: dynamodb, ec2, eks"
+      ;;
+  esac
+}
+
+deploy() {
+  if servicenow_incidents_enabled; then
+    validate_servicenow_config
+  else
+    validate_webhook_config
+  fi
+  init
+  header "Deploy Factory"
+
+  local confirm agent_topic_arn incident_topic_arn
+  echo -e "  ${D}Shared stack:${N} $INCIDENT_STACK_NAME"
+  echo -e "  ${D}Use case stack:${N} $DYNAMODB_STACK_NAME"
+  read -rp "  Deploy shared routing and DynamoDB use case in account $ACCOUNT_ID? [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
+
+  ensure_code_bucket
+  if servicenow_incidents_enabled; then
+    servicenow_update_webhook_properties
+  fi
+  preflight_resource_conflicts
+  package_lambda_artifacts incident
+
+  agent_topic_arn="$(stack_output CTDevOpsAgentStack DevOpsAgentNotificationTopicArn)"
+  [[ "$agent_topic_arn" == "None" ]] && agent_topic_arn=""
+
+  if spin "Deploying shared incident routing stack..." \
+    aws cloudformation deploy \
+      --template-file "$CFN_DIR/shared/incident-routing.yaml" \
+      --stack-name "$INCIDENT_STACK_NAME" \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides \
+        Env="$ENV" WebhookUrl="${WEBHOOK_URL:-}" WebhookSecretParam="${WEBHOOK_SECRET:-}" \
+        LambdaCodeBucket="$BUCKET" \
+        WebhookCodeKey=webhook-lambda.zip \
+        ServiceNowIncidentCodeKey=servicenow-incident-lambda.zip \
+        EnableServiceNow="${ENABLE_SERVICENOW:-false}" \
+        ServiceNowInstanceUrl="${SERVICENOW_INSTANCE_URL:-}" \
+        ServiceNowClientId="${SERVICENOW_CLIENT_ID:-}" \
+        ServiceNowClientSecret="${SERVICENOW_CLIENT_SECRET:-}" \
+        DevOpsAgentNotificationTopicArn="$agent_topic_arn" \
+      --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
+    ok "Shared incident routing deployed"
+  else
+    fail "Shared incident routing deployment failed"
+  fi
+
+  incident_topic_arn="$(stack_output "$INCIDENT_STACK_NAME" IncidentTopicArn)"
+  [[ -n "$incident_topic_arn" && "$incident_topic_arn" != "None" ]] || \
+    fail "Shared incident routing stack did not output IncidentTopicArn"
+
+  package_lambda_artifacts dynamodb
+  if spin "Deploying DynamoDB use case stack..." \
+    aws cloudformation deploy \
+      --template-file "$CFN_DIR/usecases/dynamodb-simple-lambda.yaml" \
+      --stack-name "$DYNAMODB_STACK_NAME" \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides \
+        Env="$ENV" \
+        LambdaCodeBucket="$BUCKET" \
+        AppCodeKey=simple-lambda.zip \
+        IncidentTopicArn="$incident_topic_arn" \
+      --region "$REGION" --no-fail-on-empty-changeset --no-cli-pager; then
+    ok "DynamoDB use case deployed"
+  else
+    fail "DynamoDB use case deployment failed"
   fi
 
   verify
@@ -490,8 +759,12 @@ deploy() {
 track() {
   init
   header "Stack Status"
-  aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
-    --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' --output json --no-cli-pager
+  for stack_name in "$INCIDENT_STACK_NAME" "$DYNAMODB_STACK_NAME" "$EC2_STACK_NAME" "$EKS_STACK_NAME"; do
+    echo -e "  ${D}Stack:${N} $stack_name"
+    aws cloudformation describe-stacks --stack-name "$stack_name" --region "$REGION" \
+      --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' --output json --no-cli-pager 2>/dev/null || \
+      warn "Stack not found: $stack_name"
+  done
 }
 
 verify() {
@@ -659,7 +932,7 @@ cleanup() {
   local agent_stack="CTDevOpsAgentStack"
   local confirm
 
-  echo -e "  ${R}${B}This deletes:${N} $STACK_NAME, $agent_stack, $config_bucket and $BUCKET"
+  echo -e "  ${R}${B}This deletes:${N} $EKS_STACK_NAME, $EC2_STACK_NAME, $DYNAMODB_STACK_NAME, $INCIDENT_STACK_NAME, $agent_stack, $config_bucket and $BUCKET"
   read -rp "  Proceed with cleanup? [y/N] " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Aborted."; return 0; }
 
@@ -672,10 +945,28 @@ cleanup() {
     fi
   done
 
-  if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
-    aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION" --no-cli-pager
-    spin "Deleting infrastructure stack..." aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$REGION" --no-cli-pager || \
-      warn "Infrastructure stack deletion did not complete cleanly"
+  if aws cloudformation describe-stacks --stack-name "$EKS_STACK_NAME" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "$EKS_STACK_NAME" --region "$REGION" --no-cli-pager
+    spin "Deleting EKS use case stack..." aws cloudformation wait stack-delete-complete --stack-name "$EKS_STACK_NAME" --region "$REGION" --no-cli-pager || \
+      warn "EKS use case stack deletion did not complete cleanly"
+  fi
+
+  if aws cloudformation describe-stacks --stack-name "$EC2_STACK_NAME" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "$EC2_STACK_NAME" --region "$REGION" --no-cli-pager
+    spin "Deleting EC2 use case stack..." aws cloudformation wait stack-delete-complete --stack-name "$EC2_STACK_NAME" --region "$REGION" --no-cli-pager || \
+      warn "EC2 use case stack deletion did not complete cleanly"
+  fi
+
+  if aws cloudformation describe-stacks --stack-name "$DYNAMODB_STACK_NAME" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "$DYNAMODB_STACK_NAME" --region "$REGION" --no-cli-pager
+    spin "Deleting DynamoDB use case stack..." aws cloudformation wait stack-delete-complete --stack-name "$DYNAMODB_STACK_NAME" --region "$REGION" --no-cli-pager || \
+      warn "DynamoDB use case stack deletion did not complete cleanly"
+  fi
+
+  if aws cloudformation describe-stacks --stack-name "$INCIDENT_STACK_NAME" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "$INCIDENT_STACK_NAME" --region "$REGION" --no-cli-pager
+    spin "Deleting shared incident routing stack..." aws cloudformation wait stack-delete-complete --stack-name "$INCIDENT_STACK_NAME" --region "$REGION" --no-cli-pager || \
+      warn "Shared incident routing stack deletion did not complete cleanly"
   fi
 
   if aws cloudformation describe-stacks --stack-name "$agent_stack" --region "$REGION" --no-cli-pager >/dev/null 2>&1; then
@@ -687,7 +978,10 @@ cleanup() {
   ok "Cleanup completed"
 }
 
-case "$1" in
+command="$1"
+shift
+
+case "$command" in
   pre) pre ;;
   help|-h|--help) usage ;;
   servicenow-test) servicenow_test ;;
@@ -698,12 +992,20 @@ case "$1" in
     require_env agent-stack
     provision_agent_stack
     ;;
+  shared-incident|incident-routing)
+    require_env
+    deploy_shared_incident_stack
+    ;;
+  deploy-usecase)
+    require_env
+    deploy_usecase "$@"
+    ;;
   deploy|trigger|restore|track|verify|cleanup|alarms)
     require_env
-    "$1"
+    "$command"
     ;;
   *)
-    echo -e "  ${R}Unknown command:${N} $1"
+    echo -e "  ${R}Unknown command:${N} $command"
     usage
     exit 1
     ;;

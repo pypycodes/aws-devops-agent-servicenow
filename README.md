@@ -178,20 +178,37 @@ The `.env` file is gitignored to prevent committing secrets. All `doa.sh` comman
 
 ### Step 4 — Deploy the Infrastructure
 
-Deploy the AWS CloudFormation stack with all resources:
+Deploy the shared incident routing stack and the default DynamoDB use case stack:
 
 ```bash
 ./doa.sh deploy
 ```
 
 **What this does:**
-- Shows a deployment summary (account, region, agent space, stack name) and asks for confirmation
+- Shows a deployment summary (account, region, shared stack, use case stack) and asks for confirmation
 - Creates an S3 bucket for Lambda code artifacts
-- Packages and uploads both Lambda functions (app + webhook)
-- Deploys the CloudFormation stack with DynamoDB, Lambda, EventBridge, SNS, CloudWatch Alarms, and AWS Secrets Manager
+- Packages and uploads the shared incident Lambda and DynamoDB use case Lambda
+- Deploys `cloud-formation/shared/incident-routing.yaml` with SNS and the incident Lambda
+- Deploys `cloud-formation/usecases/dynamodb-simple-lambda.yaml` with DynamoDB, SimpleLambda, EventBridge, and CloudWatch alarms
 - Runs verification to confirm all resources are healthy
 
 The deploy takes ~2 minutes. You'll see a verification summary at the end showing all 12 resources.
+
+To deploy the reusable incident routing layer separately:
+
+```bash
+./doa.sh shared-incident
+```
+
+To deploy a single use case after the shared incident stack exists:
+
+```bash
+./doa.sh deploy-usecase dynamodb
+./doa.sh deploy-usecase ec2
+./doa.sh deploy-usecase eks
+```
+
+`deploy-usecase` also creates the shared incident routing stack if it is missing. With `ENABLE_SERVICENOW=true`, that shared stack deploys the ServiceNow incident Lambda and subscribes it to the shared topic. With `ENABLE_SERVICENOW=false`, it deploys the AWS DevOps Agent webhook Lambda instead.
 
 ---
 
@@ -301,7 +318,11 @@ Remove all deployed resources:
 | Command | Description |
 |---------|-------------|
 | `./doa.sh pre` | Check and install prerequisites |
-| `./doa.sh deploy` | Deploy all infrastructure |
+| `./doa.sh shared-incident` | Deploy shared SNS + incident Lambda routing |
+| `./doa.sh deploy-usecase dynamodb` | Deploy the DynamoDB use case stack |
+| `./doa.sh deploy-usecase ec2` | Deploy the EC2 CPU stress use case stack |
+| `./doa.sh deploy-usecase eks` | Deploy the EKS node health use case stack |
+| `./doa.sh deploy` | Deploy shared routing and the DynamoDB use case |
 | `./doa.sh verify` | Verify all resources exist |
 | `./doa.sh trigger` | Inject DynamoDB throttling fault |
 | `./doa.sh restore` | Restore DynamoDB to on-demand |
@@ -315,9 +336,13 @@ Remove all deployed resources:
 ```
 ├── .env.example                   # Environment config template (copy to .env)
 ├── doa.sh                         # CLI script (deploy/verify/trigger/restore/cleanup)
-├── template.yaml                  # CloudFormation template
+├── cloud-formation/               # CloudFormation factory templates
+│   ├── devops-agent-stack.yaml    # Shared AWS DevOps Agent space
+│   ├── shared/incident-routing.yaml
+│   └── usecases/                  # DynamoDB, EC2, and EKS use cases
 ├── lambdas/
 │   ├── app/simple_lambda.py       # DynamoDB stress test Lambda
+│   ├── servicenow-incident/index.mjs
 │   └── webhook/index.mjs          # SNS → AWS DevOps Agent webhook Lambda
 ├── scripts/
 │   ├── agent_monitor.py           # Auto-monitor + RCA + mitigation

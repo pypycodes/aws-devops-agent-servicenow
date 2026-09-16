@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS DevOps Agent Demo - Shared incident routing for all use cases
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo
+  WebhookUrl:
+    Type: String
+    Default: ''
+    Description: AWS DevOps Agent webhook URL (required when EnableServiceNow is false)
+  WebhookSecretParam:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: AWS DevOps Agent webhook HMAC secret (required when EnableServiceNow is false)
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda zip files
+  WebhookCodeKey:
+    Type: String
+    Default: webhook-lambda.zip
+  ServiceNowIncidentCodeKey:
+    Type: String
+    Default: servicenow-incident-lambda.zip
+  EnableServiceNow:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: When true, route alarms to ServiceNow. When false, route alarms through the webhook Lambda.
+  ServiceNowInstanceUrl:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://[a-zA-Z0-9-]+\.service-now\.com/?$'
+    Description: ServiceNow instance URL
+  ServiceNowClientId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: ServiceNow OAuth client ID
+  ServiceNowClientSecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: ServiceNow OAuth client secret
+  DevOpsAgentNotificationTopicArn:
+    Type: String
+    Default: ''
+    Description: Existing DevOps Agent lifecycle notification topic ARN
+
+Conditions:
+  ServiceNowIncidentEnabled: !Equals [!Ref EnableServiceNow, 'true']
+  WebhookIncidentEnabled: !Not [!Equals [!Ref EnableServiceNow, 'true']]
+  ServiceNowIncidentLifecycleEnabled: !And
+    - !Equals [!Ref EnableServiceNow, 'true']
+    - !Not [!Equals [!Ref DevOpsAgentNotificationTopicArn, '']]
+
+Resources:
+  IncidentKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${Env} shared incident routing CMK'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Env}-*'
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+          - Sid: AllowSNS
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+
+  IncidentTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Env}-devops-agent-alarms'
+      KmsMasterKeyId: !Ref IncidentKey
+
+  IncidentTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref IncidentTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsOnly
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref IncidentTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${Env}-*'
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - sns:Publish
+              - sns:Subscribe
+            Resource: !Ref IncidentTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: WebhookIncidentEnabled
+    Properties:
+      Name: !Sub '${Env}-devops-agent-webhook'
+      KmsKeyId: !GetAtt IncidentKey.Arn
+      SecretString: !Sub '{"webhookUrl":"${WebhookUrl}","webhookSecret":"${WebhookSecretParam}"}'
+
+  WebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: WebhookIncidentEnabled
+    Properties:
+      RoleName: !Sub '${Env}-webhook-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref WebhookSecretsPolicy
+
+  WebhookSecretsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: WebhookIncidentEnabled
+    Properties:
+      ManagedPolicyName: !Sub '${Env}-webhook-secrets-read'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref WebhookSecret
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt IncidentKey.Arn
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt WebhookDLQ.Arn
+
+  WebhookDLQ:
+    Type: AWS::SQS::Queue
+    Condition: WebhookIncidentEnabled
+    Properties:
+      QueueName: !Sub '${Env}-webhook-dlq'
+      SqsManagedSseEnabled: false
+      KmsMasterKeyId: !Ref IncidentKey
+      MessageRetentionPeriod: 1209600
+
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: WebhookIncidentEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Env}-devops-agent-webhook'
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt IncidentKey.Arn
+
+  WebhookFunction:
+    Type: AWS::Lambda::Function
+    Condition: WebhookIncidentEnabled
+    DependsOn:
+      - WebhookLogGroup
+    Properties:
+      FunctionName: !Sub '${Env}-devops-agent-webhook'
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Timeout: 30
+      DeadLetterConfig:
+        TargetArn: !GetAtt WebhookDLQ.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref WebhookCodeKey
+      Environment:
+        Variables:
+          SECRET_NAME: !Sub '${Env}-devops-agent-webhook'
+
+  WebhookPermission:
+    Type: AWS::Lambda::Permission
+    Condition: WebhookIncidentEnabled
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref IncidentTopic
+
+  WebhookAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: WebhookIncidentEnabled
+    Properties:
+      TopicArn: !Ref IncidentTopic
+      Protocol: lambda
+      Endpoint: !GetAtt WebhookFunction.Arn
+
+  ServiceNowIncidentRole:
+    Type: AWS::IAM::Role
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      RoleName: !Sub '${Env}-servicenow-incident-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DecryptAlarmTopic
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt IncidentKey.Arn
+
+  ServiceNowIncidentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Env}-servicenow-incident'
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt IncidentKey.Arn
+
+  ServiceNowIncidentFunction:
+    Type: AWS::Lambda::Function
+    Condition: ServiceNowIncidentEnabled
+    DependsOn:
+      - ServiceNowIncidentLogGroup
+    Properties:
+      FunctionName: !Sub '${Env}-servicenow-incident'
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt ServiceNowIncidentRole.Arn
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref ServiceNowIncidentCodeKey
+      Environment:
+        Variables:
+          SERVICENOW_INSTANCE_URL: !Ref ServiceNowInstanceUrl
+          SERVICENOW_CLIENT_ID: !Ref ServiceNowClientId
+          SERVICENOW_CLIENT_SECRET: !Ref ServiceNowClientSecret
+
+  ServiceNowIncidentPermission:
+    Type: AWS::Lambda::Permission
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      FunctionName: !Ref ServiceNowIncidentFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref IncidentTopic
+
+  ServiceNowIncidentAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: ServiceNowIncidentEnabled
+    Properties:
+      TopicArn: !Ref IncidentTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ServiceNowIncidentFunction.Arn
+
+  ServiceNowIncidentSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: ServiceNowIncidentLifecycleEnabled
+    Properties:
+      TopicArn: !Ref DevOpsAgentNotificationTopicArn
+      Protocol: lambda
+      Endpoint: !GetAtt ServiceNowIncidentFunction.Arn
+
+  ServiceNowIncidentLifecyclePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ServiceNowIncidentLifecycleEnabled
+    Properties:
+      FunctionName: !Ref ServiceNowIncidentFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref DevOpsAgentNotificationTopicArn
+
+Outputs:
+  IncidentTopicArn:
+    Value: !Ref IncidentTopic
+  IncidentKeyArn:
+    Value: !GetAtt IncidentKey.Arn
+  ServiceNowIncidentFunctionName:
+    Condition: ServiceNowIncidentEnabled
+    Value: !Ref ServiceNowIncidentFunction
+  WebhookFunctionName:
+    Condition: WebhookIncidentEnabled
+    Value: !Ref WebhookFunction

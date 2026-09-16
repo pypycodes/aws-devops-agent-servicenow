@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS DevOps Agent Demo Use Case - DynamoDB throttling with Simple Lambda
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda zip files
+  AppCodeKey:
+    Type: String
+    Default: simple-lambda.zip
+  IncidentTopicArn:
+    Type: String
+    Description: Shared incident routing SNS topic ARN
+
+Resources:
+  UseCaseKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${Env} DynamoDB simple Lambda use case CMK'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Env}-simple-lambda'
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Env}-simple-lambda-config-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: Application, Value: simple-lambda }
+        - { Key: UseCase, Value: dynamodb-simple-lambda }
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ConfigBucket.Arn
+              - !Sub '${ConfigBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  StressTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Env}-stress-test-table'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: Application, Value: simple-lambda }
+        - { Key: UseCase, Value: dynamodb-simple-lambda }
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Env}-simple-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref LambdaAppPolicy
+
+  LambdaAppPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${Env}-simple-lambda-app-access'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: dynamodb:PutItem
+            Resource: !GetAtt StressTable.Arn
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Env}-simple-lambda'
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt UseCaseKey.Arn
+
+  SimpleLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${Env}-simple-lambda'
+      Runtime: python3.14
+      Handler: simple_lambda.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 90
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref AppCodeKey
+      Environment:
+        Variables:
+          STRESS_TABLE: !Ref StressTable
+          STRESS_DURATION: '60'
+      Tags:
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: Application, Value: simple-lambda }
+        - { Key: UseCase, Value: dynamodb-simple-lambda }
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Env}-simple-lambda-schedule'
+      ScheduleExpression: 'rate(1 minute)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SimpleLambda.Arn
+          Id: SimpleLambdaTarget
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SimpleLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Env}-DynamoDB-WriteThrottle'
+      AlarmDescription: DynamoDB write throttling detected
+      Namespace: AWS/DynamoDB
+      MetricName: WriteThrottleEvents
+      Dimensions:
+        - { Name: TableName, Value: !Ref StressTable }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref IncidentTopicArn]
+      OKActions: [!Ref IncidentTopicArn]
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Env}-Lambda-Errors'
+      AlarmDescription: Lambda function errors detected
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref SimpleLambda }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref IncidentTopicArn]
+      OKActions: [!Ref IncidentTopicArn]
+
+Outputs:
+  TableName:
+    Value: !Ref StressTable
+  BucketName:
+    Value: !Ref ConfigBucket
+  FunctionName:
+    Value: !Ref SimpleLambda
+  ScheduleRule:
+    Value: !Ref ScheduleRule
+  ThrottleAlarm:
+    Value: !Ref ThrottleAlarm
+  ErrorAlarm:
+    Value: !Ref ErrorAlarm

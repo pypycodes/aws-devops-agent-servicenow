@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS DevOps Agent Demo Use Case - EKS node health, OOM, and readiness alarms
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo
+  IncidentTopicArn:
+    Type: String
+    Description: Shared incident routing SNS topic ARN
+  ClusterVersion:
+    Type: String
+    Default: '1.33'
+  NodeInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+  DesiredNodeCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 4
+  NodeMemoryAlarmThreshold:
+    Type: Number
+    Default: 85
+    MinValue: 1
+    MaxValue: 100
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.43.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-eks-node-health-vpc' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: eks-node-health }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-eks-node-health-igw' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: eks-node-health }
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.43.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-eks-node-health-public-a' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: eks-node-health }
+        - { Key: !Sub 'kubernetes.io/cluster/${Env}-eks-node-health', Value: shared }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.43.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-eks-node-health-public-b' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: eks-node-health }
+        - { Key: !Sub 'kubernetes.io/cluster/${Env}-eks-node-health', Value: shared }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-eks-node-health-public-rt' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: eks-node-health }
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS node health cluster security group
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-eks-node-health-cluster-sg' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: eks-node-health }
+
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Env}-eks-node-health-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Env}-eks-node-health-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub '${Env}-eks-node-health'
+      Version: !Ref ClusterVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: false
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnetA
+          - !Ref PublicSubnetB
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: Environment
+          Value: !Ref Env
+        - Key: UseCase
+          Value: eks-node-health
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn:
+      - PublicRoute
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub '${Env}-eks-node-health-ng'
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      ScalingConfig:
+        DesiredSize: !Ref DesiredNodeCount
+        MinSize: 1
+        MaxSize: 4
+      Tags:
+        Environment: !Ref Env
+        UseCase: eks-node-health
+
+  CloudWatchObservabilityAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: amazon-cloudwatch-observability
+      ResolveConflicts: OVERWRITE
+
+  NodeMemoryHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Env}-EKS-Node-Memory-High'
+      AlarmDescription: EKS node memory utilization is high; useful for OOM simulation
+      Namespace: ContainerInsights
+      MetricName: node_memory_utilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref Cluster
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref NodeMemoryAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentTopicArn
+      OKActions:
+        - !Ref IncidentTopicArn
+
+  PodRestartsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Env}-EKS-Pod-Restarts'
+      AlarmDescription: EKS pod restarts detected; useful for OOMKilled workloads
+      Namespace: ContainerInsights
+      MetricName: pod_number_of_container_restarts
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref Cluster
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentTopicArn
+      OKActions:
+        - !Ref IncidentTopicArn
+
+  NodeNotReadyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Env}-EKS-Node-NotReady'
+      AlarmDescription: EKS node readiness condition indicates a not-ready node
+      Namespace: ContainerInsights
+      MetricName: node_status_condition_ready
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref Cluster
+        - Name: Condition
+          Value: Ready
+        - Name: Status
+          Value: 'false'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentTopicArn
+      OKActions:
+        - !Ref IncidentTopicArn
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  NodeGroupName:
+    Value: !Ref NodeGroup
+  NodeMemoryHighAlarm:
+    Value: !Ref NodeMemoryHighAlarm
+  PodRestartsAlarm:
+    Value: !Ref PodRestartsAlarm
+  NodeNotReadyAlarm:
+    Value: !Ref NodeNotReadyAlarm
+  UpdateKubeconfigCommand:
+    Value: !Sub 'aws eks update-kubeconfig --name ${Cluster} --region ${AWS::Region}'

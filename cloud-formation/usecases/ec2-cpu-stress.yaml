@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS DevOps Agent Demo Use Case - EC2 CPU stress alarm
+
+Parameters:
+  Env:
+    Type: String
+    Default: demo
+  IncidentTopicArn:
+    Type: String
+    Description: Shared incident routing SNS topic ARN
+  InstanceType:
+    Type: String
+    Default: t3.nano
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+    Description: EC2 instance type used to simulate CPU stress
+  CpuAlarmThreshold:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    MaxValue: 100
+    Description: CPUUtilization percentage that triggers the alarm
+  CpuStressDurationSeconds:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    Description: Number of seconds to run CPU stress on first boot
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-vpc' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: ec2-cpu-stress }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-igw' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: ec2-cpu-stress }
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-public-a' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: ec2-cpu-stress }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-public-rt' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: ec2-cpu-stress }
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 CPU stress instance without inbound access
+      VpcId: !Ref Vpc
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress-sg' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: ec2-cpu-stress }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Env}-ec2-cpu-stress-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${Env}-ec2-cpu-stress-profile'
+      Roles:
+        - !Ref InstanceRole
+
+  CpuStressInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          cat >/opt/cpu-stress.py <<'PY'
+          import math
+          import time
+
+          end_time = time.time() + ${CpuStressDurationSeconds}
+          while time.time() < end_time:
+              for value in range(250000):
+                  math.sqrt(value)
+          PY
+          nohup python3 /opt/cpu-stress.py >/var/log/cpu-stress.log 2>&1 &
+      Tags:
+        - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress' }
+        - { Key: Environment, Value: !Ref Env }
+        - { Key: UseCase, Value: ec2-cpu-stress }
+
+  CpuSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Env}-EC2-CPU-Spike'
+      AlarmDescription: EC2 CPU stress detected
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref CpuStressInstance
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref CpuAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref IncidentTopicArn
+      OKActions:
+        - !Ref IncidentTopicArn
+
+Outputs:
+  InstanceId:
+    Value: !Ref CpuStressInstance
+  CpuSpikeAlarm:
+    Value: !Ref CpuSpikeAlarm
+  VpcId:
+    Value: !Ref Vpc
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
