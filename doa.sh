@@ -893,11 +893,11 @@ trigger() {
   step "Limiting on-demand DynamoDB writes to 2 request units"
   update_dynamodb_on_demand_limit "$table_name" 2 || fail "Failed to set DynamoDB write limit"
 
-  step "Invoking Lambda to generate write throttling"
+  step "Queueing Lambda invocation to generate write throttling"
   if aws lambda invoke --function-name "${ENV}-simple-lambda" --region "$REGION" \
-      --cli-connect-timeout 10 --cli-read-timeout 60 --no-cli-pager \
+      --invocation-type Event --cli-connect-timeout 10 --cli-read-timeout 10 --no-cli-pager \
       /tmp/simple-lambda-response.json >/tmp/simple-lambda-invoke.json; then
-    ok "Lambda invocation completed"
+    ok "Lambda invocation queued"
   else
     fail "Lambda invocation failed"
   fi

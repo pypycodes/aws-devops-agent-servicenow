@@ -51,7 +51,7 @@ aws cloudwatch describe-alarms \
 
 > **What's happening:** This keeps the DynamoDB table on on-demand billing but caps it
 > at 2 write request units. The Lambda still fires every minute doing 60s of writes
-> — but now those writes hit the 2-unit limit, causing `WriteThrottleEvents`.
+> and `./doa.sh trigger` also queues an asynchronous invocation. Those writes hit the 2-unit limit, causing `WriteThrottleEvents`.
 > Amazon CloudWatch detects the throttling and fires the alarm within ~60 seconds.
 
 **Terminal 2:**

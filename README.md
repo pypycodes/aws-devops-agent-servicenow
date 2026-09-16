@@ -255,7 +255,7 @@ Trigger the incident by keeping DynamoDB on-demand and capping writes at 2 reque
 
 **What this does:**
 - Keeps the DynamoDB table on-demand and applies a 2-unit maximum write request limit
-- The Lambda (running every minute with 60s of continuous writes) immediately starts getting throttled
+- Queues the Lambda asynchronously; its 60s write loop starts getting throttled without blocking the CLI
 - `WriteThrottleEvents` metric spikes → CloudWatch Alarm fires → SNS → Webhook → AWS DevOps Agent investigation starts
 
 **What happens next (automated):**
