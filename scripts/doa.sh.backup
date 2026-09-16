@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
+CFN_DIR="$SCRIPT_DIR/../cloud-formation"
 
 # Colors
 G='\033[38;5;114m' Y='\033[38;5;222m' C='\033[38;5;117m' R='\033[38;5;210m' D='\033[38;5;243m' B='\033[1m' N='\033[0m'
@@ -271,7 +272,7 @@ provision_agent_stack() {
   step "Deploying CloudFormation stack: $STACK_NAME_AGENT"
   if spin "Provisioning DevOps agent stack..." \
     aws cloudformation deploy \
-      --template-file "$SCRIPT_DIR/devops-agent-stack.yaml" \
+      --template-file "$CFN_DIR/devops-agent-stack.yaml" \
       --stack-name "$STACK_NAME_AGENT" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides \
@@ -346,7 +347,7 @@ deploy() {
     --output text 2>/dev/null || true)
   if spin "Deploying stack (this takes ~2 min)..." \
     aws cloudformation deploy \
-      --template-file "$SCRIPT_DIR/template.yaml" \
+      --template-file "$CFN_DIR/template.yaml" \
       --stack-name "$STACK_NAME" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides \

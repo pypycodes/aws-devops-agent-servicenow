@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
+CFN_DIR="$SCRIPT_DIR/cloud-formation"
 
 # Prevent AWS CLI from opening less or prompting interactively.
 export AWS_PAGER=""
@@ -224,6 +225,46 @@ servicenow_update_webhook_properties() {
   ok "Webhook HMAC secret updated, fingerprint: $secret_fingerprint"
 }
 
+stack_owns_resource() {
+  local logical_id="$1" physical_id="$2" actual_id
+
+  actual_id="$(aws cloudformation describe-stack-resource \
+    --stack-name "$STACK_NAME" \
+    --logical-resource-id "$logical_id" \
+    --region "$REGION" \
+    --query 'StackResourceDetail.PhysicalResourceId' \
+    --output text --no-cli-pager 2>/dev/null || true)"
+
+  [[ "$actual_id" == "$physical_id" ]]
+}
+
+check_log_group_conflict() {
+  local logical_id="$1" log_group_name="$2" existing_log_group
+
+  existing_log_group="$(aws logs describe-log-groups \
+    --log-group-name-prefix "$log_group_name" \
+    --region "$REGION" \
+    --query "logGroups[?logGroupName=='$log_group_name'].logGroupName | [0]" \
+    --output text --no-cli-pager)"
+
+  if [[ "$existing_log_group" != "None" ]] && ! stack_owns_resource "$logical_id" "$log_group_name"; then
+    fail "CloudWatch log group already exists outside stack: $log_group_name. Delete it or choose a new ENV before deploying."
+  fi
+}
+
+preflight_resource_conflicts() {
+  step "Checking for orphaned CloudWatch log groups"
+  check_log_group_conflict LambdaLogGroup "/aws/lambda/${ENV}-simple-lambda"
+
+  if servicenow_incidents_enabled; then
+    check_log_group_conflict ServiceNowIncidentLogGroup "/aws/lambda/${ENV}-servicenow-incident"
+  else
+    check_log_group_conflict WebhookLogGroup "/aws/lambda/${ENV}-devops-agent-webhook"
+  fi
+
+  ok "No orphaned log group conflicts found"
+}
+
 servicenow_verify() {
   local access_token
   validate_servicenow_oauth_config
@@ -348,7 +389,7 @@ provision_agent_stack() {
 
   if spin "Provisioning DevOps Agent stack..." \
     aws cloudformation deploy \
-      --template-file "$SCRIPT_DIR/devops-agent-stack.yaml" \
+      --template-file "$CFN_DIR/devops-agent-stack.yaml" \
       --stack-name "$agent_stack" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides \
@@ -376,6 +417,7 @@ deploy() {
   fi
   init
   header "Deploy Infrastructure"
+  preflight_resource_conflicts
 
   local confirm agent_topic_arn package_dir
   read -rp "  Deploy $STACK_NAME in account $ACCOUNT_ID? [y/N] " confirm
@@ -423,7 +465,7 @@ deploy() {
 
   if spin "Deploying infrastructure stack..." \
     aws cloudformation deploy \
-      --template-file "$SCRIPT_DIR/template.yaml" \
+      --template-file "$CFN_DIR/template.yaml" \
       --stack-name "$STACK_NAME" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides \
