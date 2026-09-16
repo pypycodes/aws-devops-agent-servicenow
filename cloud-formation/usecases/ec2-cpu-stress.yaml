@@ -183,17 +183,47 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -euxo pipefail
-          cat >/tmp/stress.py <<'PY'
+          cat >/usr/local/bin/ec2-cpu-stress.py <<'PY'
           import math
+          import multiprocessing
+          import sys
           import time
 
-          end_time = time.time() + ${CpuStressDurationSeconds}
-          while time.time() < end_time:
-              for value in range(250000):
-                  math.sqrt(value)
+          def burn():
+              while True:
+                  for value in range(1000000):
+                      math.sqrt(value)
+
+          duration = int(sys.argv[1]) if len(sys.argv) > 1 else ${CpuStressDurationSeconds}
+          processes = [multiprocessing.Process(target=burn) for _ in range(multiprocessing.cpu_count())]
+
+          for process in processes:
+              process.start()
+
+          try:
+              time.sleep(duration)
+          finally:
+              for process in processes:
+                  process.terminate()
+              for process in processes:
+                  process.join()
           PY
-          chmod 700 /tmp/stress.py
-          nohup python3 /tmp/stress.py >/var/log/cpu-stress.log 2>&1 &
+          chmod 700 /usr/local/bin/ec2-cpu-stress.py
+          cat >/etc/systemd/system/ec2-cpu-stress-script.service <<'UNIT'
+          [Unit]
+          Description=Recreate /tmp/stress.py for EC2 CPU stress use case
+          After=local-fs.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/install -m 700 /usr/local/bin/ec2-cpu-stress.py /tmp/stress.py
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now ec2-cpu-stress-script.service
+          nohup python3 /tmp/stress.py ${CpuStressDurationSeconds} >/var/log/cpu-stress.log 2>&1 &
       Tags:
         - { Key: Name, Value: !Sub '${Env}-ec2-cpu-stress' }
         - { Key: Environment, Value: !Ref Env }
